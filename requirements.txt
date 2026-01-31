@@ -17,3 +17,7 @@ supervision
 easyocr
 timm
 einops
+fastapi
+uvicorn
+playwright
+pydantic
