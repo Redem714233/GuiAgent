@@ -32,12 +32,32 @@ class ParseRequest(BaseModel):
 class PlanRequest(BaseModel):
     task: str
     elements: List[Element]
+    image_size: Optional[Tuple[int, int]] = None
+    annotated_image_base64: Optional[str] = None
 
 
 class PlanResponse(BaseModel):
     target_id: Optional[int] = None
+    target_point: Optional[Tuple[int, int]] = None
+    action_tool: Optional[str] = None
+    action_text: Optional[str] = None
+    action_key: Optional[str] = None
+    action_ms: Optional[int] = None
+    action_url: Optional[str] = None
     reason: str = ""
     query: Optional[str] = None
+    debug: Optional[dict] = None
+
+
+class PlanStepsRequest(BaseModel):
+    task: str
+    max_steps: Optional[int] = 6
+    annotated_image_base64: Optional[str] = None
+
+
+class PlanStepsResponse(BaseModel):
+    steps: List[str]
+    debug: Optional[dict] = None
 
 
 class StepRequest(BaseModel):
@@ -45,12 +65,22 @@ class StepRequest(BaseModel):
     # If provided, bypass LLM selection
     override_target_id: Optional[int] = None
     override_point: Optional[Tuple[int, int]] = None
+    plan_context: Optional[str] = None
 
 
 class StepResponse(BaseModel):
     action: str
     target_id: Optional[int] = None
+    target_point: Optional[Tuple[int, int]] = None
+    action_tool: Optional[str] = None
+    action_text: Optional[str] = None
+    action_key: Optional[str] = None
+    action_ms: Optional[int] = None
+    action_url: Optional[str] = None
     reason: str = ""
     screenshot_path: Optional[str] = None
     annotated_image_base64: Optional[str] = None
     elements: Optional[List[Element]] = None
+    current_url: Optional[str] = None
+    planner_debug: Optional[dict] = None
+    finish_debug: Optional[dict] = None

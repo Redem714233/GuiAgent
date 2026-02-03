@@ -16,6 +16,9 @@ class Executor:
         self._channel = os.getenv("PLAYWRIGHT_CHANNEL")
         self._executable = os.getenv("PLAYWRIGHT_EXECUTABLE")
         self._start_url = os.getenv("PLAYWRIGHT_START_URL")
+        self._viewport_width = int(os.getenv("PLAYWRIGHT_VIEWPORT_WIDTH", "1280"))
+        self._viewport_height = int(os.getenv("PLAYWRIGHT_VIEWPORT_HEIGHT", "720"))
+        self._device_scale_factor = float(os.getenv("PLAYWRIGHT_DEVICE_SCALE_FACTOR", "1"))
 
     def _on_new_page(self, page) -> None:
         # If navigation opens a new tab/window, switch to it for subsequent actions/screenshot.
@@ -33,7 +36,10 @@ class Executor:
         if self._executable:
             launch_kwargs["executable_path"] = self._executable
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        self._context = await self._browser.new_context()
+        self._context = await self._browser.new_context(
+            viewport={"width": self._viewport_width, "height": self._viewport_height},
+            device_scale_factor=self._device_scale_factor,
+        )
         self._context.on("page", self._on_new_page)
         self._page = await self._context.new_page()
         if self._start_url:
@@ -48,7 +54,10 @@ class Executor:
             await self._start_fresh()
             return
         if self._context is None:
-            self._context = await self._browser.new_context()
+            self._context = await self._browser.new_context(
+                viewport={"width": self._viewport_width, "height": self._viewport_height},
+                device_scale_factor=self._device_scale_factor,
+            )
             self._context.on("page", self._on_new_page)
         if self._page is None or self._page.is_closed():
             self._page = await self._context.new_page()
@@ -89,11 +98,11 @@ class Executor:
     async def screenshot(self, path: str) -> None:
         try:
             await self._ensure_page()
-            await self._page.screenshot(path=path, full_page=True)
+            await self._page.screenshot(path=path, full_page=False)
         except Exception:
             await self._restart()
             await self._ensure_page()
-            await self._page.screenshot(path=path, full_page=True)
+            await self._page.screenshot(path=path, full_page=False)
 
     async def click_center(self, center: Tuple[int, int]) -> None:
         try:
@@ -158,9 +167,37 @@ class Executor:
             )
         return dom_elements
 
+    async def get_url(self) -> str:
+        await self._ensure_page()
+        return self._page.url
+
+    async def wait_for_url_change(self, old_url: str, timeout_ms: int = 15000) -> None:
+        await self._ensure_page()
+        if self._page.url != old_url:
+            return
+        try:
+            await self._page.wait_for_function(
+                "oldUrl => location.href !== oldUrl",
+                old_url,
+                timeout=timeout_ms,
+            )
+        except Exception:
+            pass
+
+    async def wait_for_stable(self, delay_ms: int = 3000) -> None:
+        await self._ensure_page()
+        try:
+            await self._page.wait_for_timeout(delay_ms)
+        except Exception:
+            pass
+
     async def wait_for_load(self, timeout_ms: int = 15000) -> None:
         await self._ensure_page()
         try:
             await self._page.wait_for_load_state("networkidle", timeout=timeout_ms)
         except Exception:
             await self._page.wait_for_load_state("load", timeout=timeout_ms)
+        try:
+            await self._page.wait_for_timeout(500)
+        except Exception:
+            pass
