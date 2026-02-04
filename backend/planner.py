@@ -50,6 +50,7 @@ class Planner:
             elements,
             annotated_image_base64=request.annotated_image_base64,
             image_size=request.image_size,
+            plan_context=getattr(request, "plan_context", None),
         )
         if llm_action:
             self._last_query = llm_action.get("query")
@@ -61,6 +62,7 @@ class Planner:
                 action_key=llm_action.get("action_key"),
                 action_ms=llm_action.get("action_ms"),
                 action_url=llm_action.get("action_url"),
+                action_scroll=llm_action.get("action_scroll"),
                 reason="llm",
                 query=self._last_query,
                 debug=debug,
@@ -75,6 +77,7 @@ class Planner:
         *,
         annotated_image_base64: Optional[str] = None,
         image_size: Optional[tuple[int, int]] = None,
+        plan_context: Optional[str] = None,
     ) -> tuple[Optional[dict], Optional[dict]]:
         if not elements and not annotated_image_base64:
             return None, None
@@ -93,6 +96,7 @@ class Planner:
                     elements=compact,
                     annotated_image_base64=annotated_image_base64,
                     image_size=image_size,
+                    plan_context=plan_context,
                 )
                 action = self._parse_action(resp, image_size)
                 debug = {
@@ -197,6 +201,7 @@ class Planner:
             "action_key": resp.get("key"),
             "action_ms": resp.get("ms") if isinstance(resp.get("ms"), int) else None,
             "action_url": resp.get("url"),
+            "action_scroll": resp.get("scroll") if isinstance(resp.get("scroll"), int) else None,
             "target_id": target_id,
             "target_point": target_point,
             "query": resp.get("query"),
@@ -445,3 +450,49 @@ class Planner:
         h_zone = "left" if cx < img_w / 3 else "right" if cx > img_w * 2 / 3 else "center"
         v_zone = "top" if cy < img_h / 3 else "bottom" if cy > img_h * 2 / 3 else "center"
         return f"{v_zone}-{h_zone}"
+
+    def extract_task_spec(self, task: str) -> tuple[dict, dict]:
+        if self._vlm_provider in {"qwen3-vl", "dashscope"}:
+            if self._vlm is None:
+                from backend.vlm_service import VLMService
+
+                self._vlm = VLMService()
+            resp, raw = self._vlm.extract_task_spec(task=task)
+            debug = {
+                "provider": self._vlm_provider,
+                "model": os.getenv("VLM_MODEL", ""),
+                "request": {"task": task},
+                "response": resp,
+                "response_raw": raw,
+            }
+            return resp, debug
+        return {"count": 10}, {"provider": "none"}
+
+    def extract_from_page(
+        self,
+        *,
+        task: str,
+        mode: str,
+        annotated_image_base64: str,
+        current_url: str,
+    ) -> tuple[dict, dict]:
+        if self._vlm_provider in {"qwen3-vl", "dashscope"}:
+            if self._vlm is None:
+                from backend.vlm_service import VLMService
+
+                self._vlm = VLMService()
+            resp, raw = self._vlm.extract_from_page(
+                task=task,
+                mode=mode,
+                annotated_image_base64=annotated_image_base64,
+                current_url=current_url,
+            )
+            debug = {
+                "provider": self._vlm_provider,
+                "model": os.getenv("VLM_MODEL", ""),
+                "request": {"task": task, "mode": mode, "url": current_url, "image": True},
+                "response": resp,
+                "response_raw": raw,
+            }
+            return resp, debug
+        return {}, {"provider": "none"}

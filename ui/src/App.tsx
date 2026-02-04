@@ -19,6 +19,7 @@ type StepResponse = {
   action_key?: string | null;
   action_ms?: number | null;
   action_url?: string | null;
+  action_scroll?: number | null;
   reason?: string;
   annotated_image_base64?: string;
   elements?: ElementItem[];
@@ -30,6 +31,25 @@ type StepResponse = {
 type PlanStepsResponse = {
   steps: string[];
   debug?: Record<string, unknown> | null;
+};
+
+type TaskSpecResponse = {
+  data: Record<string, unknown>;
+  debug?: Record<string, unknown> | null;
+};
+
+type FileListResponse = {
+  files: string[];
+};
+
+type RunExtractionResponse = {
+  status: string;
+  items_extracted: number;
+  target_count: number;
+  file_path: string | null;
+  progress: Array<Record<string, unknown>>;
+  errors: string[];
+  items: Array<Record<string, unknown>>;
 };
 
 function App() {
@@ -46,7 +66,15 @@ function App() {
   const [planDebug, setPlanDebug] = useState<Record<string, unknown> | null>(null);
   const [stepDebug, setStepDebug] = useState<Record<string, unknown> | null>(null);
   const [finishDebug, setFinishDebug] = useState<Record<string, unknown> | null>(null);
+  const [taskSpec, setTaskSpec] = useState<Record<string, unknown> | null>(null);
+  const [taskSpecDebug, setTaskSpecDebug] = useState<Record<string, unknown> | null>(null);
+  const [files, setFiles] = useState<string[]>([]);
   const [lastTargetPoint, setLastTargetPoint] = useState<[number, number] | null>(null);
+  const [extractionResult, setExtractionResult] = useState<RunExtractionResponse | null>(null);
+  const [extractionLoading, setExtractionLoading] = useState(false);
+  const [maxItems, setMaxItems] = useState<number>(10);
+  const [useOmniparser, setUseOmniparser] = useState<boolean>(true);
+  const [listOnly, setListOnly] = useState<boolean>(false);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
   const imgSrc = useMemo(() => {
@@ -113,6 +141,7 @@ function App() {
         action_key: data.action_key || null,
         action_ms: data.action_ms || null,
         action_url: data.action_url || null,
+        action_scroll: data.action_scroll || null,
       });
       setFinishDebug(data.finish_debug || null);
       setStatus(`done (${data.reason || data.action || ""})`);
@@ -148,6 +177,65 @@ function App() {
       setStatus(`error: ${String(err)}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleTaskSpec = async () => {
+    setLoading(true);
+    setStatus("task spec...");
+    setTaskSpec(null);
+    setTaskSpecDebug(null);
+    try {
+      const resp = await fetch(`${API_BASE}/task_spec`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task }),
+      });
+      const data: TaskSpecResponse = await resp.json();
+      setTaskSpec(data.data || null);
+      setTaskSpecDebug(data.debug || null);
+      setStatus("task spec ready");
+    } catch (err) {
+      setStatus(`error: ${String(err)}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRefreshFiles = async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/files`);
+      const data: FileListResponse = await resp.json();
+      setFiles(data.files || []);
+    } catch (err) {
+      setStatus(`error: ${String(err)}`);
+    }
+  };
+
+  const handleRunExtraction = async () => {
+    setExtractionLoading(true);
+    setStatus("running extraction...");
+    setExtractionResult(null);
+    try {
+      const resp = await fetch(`${API_BASE}/run_extraction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task,
+          max_items: maxItems,
+          strategy: { list_only: listOnly },
+          use_omniparser: useOmniparser,
+        }),
+      });
+      const data: RunExtractionResponse = await resp.json();
+      setExtractionResult(data);
+      setStatus(`extraction ${data.status}: ${data.items_extracted}/${data.target_count} items`);
+      // 自动刷新文件列表
+      await handleRefreshFiles();
+    } catch (err) {
+      setStatus(`error: ${String(err)}`);
+    } finally {
+      setExtractionLoading(false);
     }
   };
 
@@ -195,11 +283,48 @@ function App() {
           <button onClick={handleRun} disabled={loading}>
             Run
           </button>
+          <button onClick={handleTaskSpec} disabled={loading}>
+            Task Spec
+          </button>
           <button
             onClick={handleNextStep}
             disabled={loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1}
           >
             下一步
+          </button>
+          <button onClick={handleRunExtraction} disabled={extractionLoading || loading}>
+            🚀 开始提取
+          </button>
+          <input
+            type="number"
+            value={maxItems}
+            onChange={(e) => setMaxItems(Math.max(1, Math.min(100, parseInt(e.target.value) || 10)))}
+            style={{ width: 60, padding: "4px 8px" }}
+            min={1}
+            max={100}
+            disabled={extractionLoading}
+          />
+          <span style={{ fontSize: 12, color: "#666" }}>条</span>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={useOmniparser}
+              onChange={(e) => setUseOmniparser(e.target.checked)}
+              disabled={extractionLoading}
+            />
+            <span>使用标注图</span>
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={listOnly}
+              onChange={(e) => setListOnly(e.target.checked)}
+              disabled={extractionLoading}
+            />
+            <span>仅列表(快速)</span>
+          </label>
+          <button onClick={handleRefreshFiles} disabled={loading}>
+            刷新文件
           </button>
           <span>{status}</span>
         </div>
@@ -242,6 +367,16 @@ function App() {
         <div style={{ fontWeight: 600 }}>Debug</div>
         <div style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 1fr 1fr" }}>
           <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
+            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Task Spec</div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
+              {taskSpec ? JSON.stringify(taskSpec, null, 2) : "(empty)"}
+            </pre>
+            <div style={{ fontWeight: 600, fontSize: 12, margin: "8px 0 6px" }}>Task Spec Debug</div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
+              {taskSpecDebug ? JSON.stringify(taskSpecDebug, null, 2) : "(empty)"}
+            </pre>
+          </div>
+          <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
             <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Plan Steps</div>
             <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
               {planDebug ? JSON.stringify(planDebug, null, 2) : "(empty)"}
@@ -264,6 +399,87 @@ function App() {
           </div>
         </div>
       </div>
+
+      <div style={{ display: "grid", gap: 6, maxWidth: 1200 }}>
+        <div style={{ fontWeight: 600 }}>Outputs</div>
+        {files.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#666" }}>No output files yet.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 4 }}>
+            {files.map((file) => (
+              <a key={file} href={`${API_BASE}/files/${encodeURIComponent(file)}`} target="_blank" rel="noreferrer">
+                {file}
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {extractionResult && (
+        <div style={{ display: "grid", gap: 8, maxWidth: 1200, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fafafa" }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>提取结果</div>
+          <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
+            <div>状态: <span style={{ color: extractionResult.status === 'success' ? '#2e7d32' : extractionResult.status === 'partial' ? '#f57c00' : '#d32f2f', fontWeight: 600 }}>{extractionResult.status}</span></div>
+            <div>已提取: {extractionResult.items_extracted} / {extractionResult.target_count} 条</div>
+            {extractionResult.file_path && (
+              <div>
+                文件: <a href={`${API_BASE}/files/${encodeURIComponent(extractionResult.file_path)}`} target="_blank" rel="noreferrer" style={{ color: "#1e90ff" }}>
+                  {extractionResult.file_path}
+                </a>
+              </div>
+            )}
+            {extractionResult.errors.length > 0 && (
+              <div style={{ color: "#d32f2f" }}>
+                错误: {extractionResult.errors.join("; ")}
+              </div>
+            )}
+          </div>
+
+          {extractionResult.items.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>数据预览</div>
+              <div style={{ overflowX: "auto", maxHeight: 400, border: "1px solid #ddd", borderRadius: 4 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ background: "#f5f5f5", borderBottom: "2px solid #ddd" }}>
+                      {Object.keys(extractionResult.items[0]).map((key) => (
+                        <th key={key} style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600 }}>
+                          {key}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {extractionResult.items.map((item, idx) => (
+                      <tr key={idx} style={{ borderBottom: "1px solid #eee" }}>
+                        {Object.values(item).map((value, vidx) => (
+                          <td key={vidx} style={{ padding: "8px 12px", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {String(value)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {extractionResult.progress.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>执行进度</div>
+              <div style={{ display: "grid", gap: 4 }}>
+                {extractionResult.progress.map((prog, idx) => (
+                  <div key={idx} style={{ padding: "6px 8px", background: "#fff", border: "1px solid #ddd", borderRadius: 4, fontSize: 12 }}>
+                    <span style={{ fontWeight: 600 }}>{String(prog.stage)}</span>: {String(prog.status)}
+                    {prog.items !== undefined && ` (${prog.items} items)`}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div
         style={{

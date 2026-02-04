@@ -201,3 +201,45 @@ class Executor:
             await self._page.wait_for_timeout(500)
         except Exception:
             pass
+
+    async def scroll_by(self, delta_y: int) -> None:
+        await self._ensure_page()
+        try:
+            await self._page.mouse.wheel(0, delta_y)
+        except Exception:
+            await self._restart()
+            await self._ensure_page()
+            await self._page.mouse.wheel(0, delta_y)
+
+    async def scroll_to(self, y: int) -> None:
+        await self._ensure_page()
+        try:
+            await self._page.evaluate("y => window.scrollTo(0, y)", y)
+        except Exception:
+            await self._restart()
+            await self._ensure_page()
+            await self._page.evaluate("y => window.scrollTo(0, y)", y)
+
+    async def extract_text_by_selector(self, selector: str) -> str:
+        await self._ensure_page()
+        handle = await self._page.query_selector(selector)
+        if not handle:
+            return ""
+        try:
+            return (await handle.inner_text()) or ""
+        except Exception:
+            return ""
+
+    async def extract_links(self, selector: str) -> list[dict]:
+        await self._ensure_page()
+        handles = await self._page.query_selector_all(selector)
+        results: list[dict] = []
+        for handle in handles:
+            try:
+                href = await handle.get_attribute("href")
+                text = (await handle.inner_text()) or ""
+                if href:
+                    results.append({"text": text.strip(), "href": href.strip()})
+            except Exception:
+                continue
+        return results

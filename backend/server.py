@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 from typing import Optional
@@ -8,13 +9,18 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from backend.executor import Executor
 from backend.omniparser_service import OmniParserService
 from backend.planner import Planner
 from backend.schemas import ParseRequest, ParseResponse, PlanRequest, PlanResponse, StepRequest, StepResponse
 from backend.schemas import Element, PlanStepsRequest, PlanStepsResponse
+from backend.schemas import TaskSpec, ExtractRequest, ExtractResponse, AppendRowRequest, AppendRowResponse
+from backend.schemas import SaveOutputResponse, FileListResponse, RunExtractionRequest, RunExtractionResponse
+from backend.output_store import OutputStore
 from backend.storage import ensure_dir, timestamp_name
+from backend.extraction_engine import ExtractionEngine
 
 load_dotenv()
 
@@ -34,6 +40,18 @@ executor = Executor()
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data", "screenshots"))
 ensure_dir(DATA_DIR)
+
+OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data", "outputs"))
+ensure_dir(OUTPUT_DIR)
+output_store = OutputStore(OUTPUT_DIR)
+
+extraction_engine = ExtractionEngine(
+    executor=executor,
+    parser_service=parser_service,
+    planner=planner,
+    output_store=output_store,
+    data_dir=DATA_DIR,
+)
 
 
 @app.post("/parse", response_model=ParseResponse)
@@ -164,6 +182,7 @@ async def step(request: StepRequest) -> StepResponse:
     action_key = None
     action_ms = None
     action_url = None
+    action_scroll = None
     reason = "override"
     llm_query = None
     if target_id is None and request.override_point is None:
@@ -173,6 +192,7 @@ async def step(request: StepRequest) -> StepResponse:
                 elements=parse_resp.elements,
                 image_size=parse_resp.image_size,
                 annotated_image_base64=parse_resp.annotated_image_base64,
+                plan_context=request.plan_context,
             )
         )
         target_id = plan_resp.target_id
@@ -182,6 +202,7 @@ async def step(request: StepRequest) -> StepResponse:
         action_key = plan_resp.action_key
         action_ms = plan_resp.action_ms
         action_url = plan_resp.action_url
+        action_scroll = plan_resp.action_scroll
         reason = plan_resp.reason
         llm_query = plan_resp.query
         planner_debug = plan_resp.debug
@@ -212,6 +233,9 @@ async def step(request: StepRequest) -> StepResponse:
         elif action_tool == "press":
             await executor.press(action_key or "Enter")
             await executor.wait_for_load()
+        elif action_tool == "scroll":
+            await executor.scroll_by(action_scroll or 600)
+            await executor.wait_for_stable(800)
         elif action_tool == "goto":
             if not action_url:
                 return StepResponse(
@@ -223,6 +247,7 @@ async def step(request: StepRequest) -> StepResponse:
                     action_key=action_key,
                     action_ms=action_ms,
                     action_url=action_url,
+                    action_scroll=action_scroll,
                     reason="no_url",
                     screenshot_path=screenshot_path,
                     annotated_image_base64=parse_resp.annotated_image_base64,
@@ -244,6 +269,7 @@ async def step(request: StepRequest) -> StepResponse:
                     action_text=action_text,
                     action_key=action_key,
                     action_ms=action_ms,
+                    action_scroll=action_scroll,
                     reason="no_text",
                     screenshot_path=screenshot_path,
                     annotated_image_base64=parse_resp.annotated_image_base64,
@@ -285,6 +311,7 @@ async def step(request: StepRequest) -> StepResponse:
             action_key=action_key,
             action_ms=action_ms,
             action_url=action_url,
+            action_scroll=action_scroll,
             reason=reason,
             screenshot_path=new_path,
             annotated_image_base64=new_parse.annotated_image_base64,
@@ -339,6 +366,7 @@ async def step(request: StepRequest) -> StepResponse:
                 action_key=action_key,
                 action_ms=action_ms,
                 action_url=action_url,
+                action_scroll=action_scroll,
                 reason=reason,
                 screenshot_path=new_path,
                 annotated_image_base64=new_parse.annotated_image_base64,
@@ -369,6 +397,7 @@ async def step(request: StepRequest) -> StepResponse:
             action_key=action_key,
             action_ms=action_ms,
             action_url=action_url,
+            action_scroll=action_scroll,
             reason=reason,
             screenshot_path=new_path,
             annotated_image_base64=new_parse.annotated_image_base64,
@@ -400,6 +429,7 @@ async def step(request: StepRequest) -> StepResponse:
             action_key=action_key,
             action_ms=action_ms,
             action_url=action_url,
+            action_scroll=action_scroll,
             reason=reason,
             screenshot_path=new_path,
             annotated_image_base64=new_parse.annotated_image_base64,
@@ -418,6 +448,7 @@ async def step(request: StepRequest) -> StepResponse:
             action_key=action_key,
             action_ms=action_ms,
             action_url=action_url,
+            action_scroll=action_scroll,
             reason="no_target",
             screenshot_path=screenshot_path,
             annotated_image_base64=parse_resp.annotated_image_base64,
@@ -436,6 +467,7 @@ async def step(request: StepRequest) -> StepResponse:
         action_key=action_key,
         action_ms=action_ms,
         action_url=action_url,
+        action_scroll=action_scroll,
         reason=reason,
         screenshot_path=screenshot_path,
         annotated_image_base64=parse_resp.annotated_image_base64,
@@ -514,3 +546,81 @@ async def run(request: dict) -> dict:
         "finish_reason": finish_reason,
         "steps": [s.model_dump() for s in steps],
     }
+
+
+@app.post("/task_spec", response_model=ExtractResponse)
+def task_spec(request: dict) -> ExtractResponse:
+    task = str(request.get("task", "")).strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+    spec, debug = planner.extract_task_spec(task)
+    return ExtractResponse(data=spec, debug=debug, spec=spec)
+
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract(request: ExtractRequest) -> ExtractResponse:
+    try:
+        screenshot_path, parse_resp = await _capture_and_parse()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Parse failed: {exc}") from exc
+    current_url = await executor.get_url()
+    data, debug = planner.extract_from_page(
+        task=request.task,
+        mode=request.mode,
+        annotated_image_base64=parse_resp.annotated_image_base64,
+        current_url=current_url,
+    )
+    output_store.set_last_extract(data)
+    return ExtractResponse(data=data, debug=debug, spec=request.spec.model_dump())
+
+
+@app.post("/append_row", response_model=AppendRowResponse)
+def append_row(request: AppendRowRequest) -> AppendRowResponse:
+    output_store.append_row(request.row)
+    return AppendRowResponse(count=len(output_store.rows))
+
+
+@app.post("/save_output", response_model=SaveOutputResponse)
+def save_output(request: dict) -> SaveOutputResponse:
+    file_name = request.get("file_name")
+    path = output_store.save_excel(file_name)
+    return SaveOutputResponse(file=os.path.basename(path))
+
+
+@app.get("/files", response_model=FileListResponse)
+def list_files() -> FileListResponse:
+    return FileListResponse(files=output_store.list_files())
+
+
+@app.get("/files/{name}")
+def download_file(name: str):
+    path = output_store.get_file_path(name)
+    if not path:
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(path)
+
+
+@app.post("/run_extraction", response_model=RunExtractionResponse)
+async def run_extraction(request: RunExtractionRequest) -> RunExtractionResponse:
+    """
+    运行完整的数据提取流程
+
+    自动执行：
+    1. 解析任务规格
+    2. 导航到目标网站
+    3. 循环提取列表数据（支持滚动/翻页）
+    4. 可选：进入详情页提取详细数据
+    5. 保存到Excel
+
+    示例任务:
+    - "进入新浪新闻，复制今天的前10条新闻标题和内容"
+    - "打开哔哩哔哩，随机进入一个视频，复制最上方的一条评论"
+    """
+    result = await extraction_engine.run_extraction(
+        task=request.task,
+        max_items=request.max_items,
+        strategy=request.strategy,
+        use_omniparser=request.use_omniparser,
+    )
+    return RunExtractionResponse(**result)
+

@@ -34,6 +34,7 @@ class PlanRequest(BaseModel):
     elements: List[Element]
     image_size: Optional[Tuple[int, int]] = None
     annotated_image_base64: Optional[str] = None
+    plan_context: Optional[str] = None
 
 
 class PlanResponse(BaseModel):
@@ -44,6 +45,7 @@ class PlanResponse(BaseModel):
     action_key: Optional[str] = None
     action_ms: Optional[int] = None
     action_url: Optional[str] = None
+    action_scroll: Optional[int] = None
     reason: str = ""
     query: Optional[str] = None
     debug: Optional[dict] = None
@@ -77,6 +79,7 @@ class StepResponse(BaseModel):
     action_key: Optional[str] = None
     action_ms: Optional[int] = None
     action_url: Optional[str] = None
+    action_scroll: Optional[int] = None
     reason: str = ""
     screenshot_path: Optional[str] = None
     annotated_image_base64: Optional[str] = None
@@ -84,3 +87,58 @@ class StepResponse(BaseModel):
     current_url: Optional[str] = None
     planner_debug: Optional[dict] = None
     finish_debug: Optional[dict] = None
+    extracted: Optional[dict] = None
+
+
+class TaskSpec(BaseModel):
+    target_site: Optional[str] = None
+    count: int = Field(10, ge=1)
+    fields: List[str] = Field(default_factory=lambda: ["title", "url", "content", "time", "source"])
+    filters: Optional[dict] = None
+    output: Optional[dict] = None
+    strategy: Optional[dict] = None
+
+
+class ExtractRequest(BaseModel):
+    task: str
+    spec: TaskSpec
+    mode: str = "list"
+
+
+class ExtractResponse(BaseModel):
+    data: dict
+    debug: Optional[dict] = None
+    spec: Optional[dict] = None
+
+
+class AppendRowRequest(BaseModel):
+    row: dict
+
+
+class AppendRowResponse(BaseModel):
+    count: int
+
+
+class SaveOutputResponse(BaseModel):
+    file: str
+
+
+class FileListResponse(BaseModel):
+    files: List[str]
+
+
+class RunExtractionRequest(BaseModel):
+    task: str
+    max_items: int = Field(10, ge=1, le=100)
+    strategy: Optional[dict] = None
+    use_omniparser: bool = Field(True, description="是否使用OmniParser标注图片（False则使用原始截图）")
+
+
+class RunExtractionResponse(BaseModel):
+    status: str  # 'success' | 'partial' | 'failed'
+    items_extracted: int
+    target_count: int
+    file_path: Optional[str] = None
+    progress: List[dict]
+    errors: List[str]
+    items: List[dict]  # 提取的数据供前端预览
