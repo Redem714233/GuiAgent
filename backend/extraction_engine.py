@@ -51,7 +51,7 @@ class ExtractionEngine:
         task: str,
         max_items: int = 10,
         strategy: Optional[Dict[str, Any]] = None,
-        use_omniparser: bool = True,
+        use_omniparser: bool = False,
     ) -> Dict[str, Any]:
         """
         运行完整的数据提取流程
@@ -81,7 +81,8 @@ class ExtractionEngine:
         progress: List[Dict[str, Any]] = []
         errors: List[str] = []
         extracted_items: List[Dict[str, Any]] = []
-        seen_urls: set[str] = set()  # 去重
+        seen_urls: set[str] = set()  # URL 去重
+        seen_titles: set[str] = set()  # Title 去重（新增）
 
         # 初始化实例进度状态
         self.current_progress = progress
@@ -124,6 +125,10 @@ class ExtractionEngine:
             consecutive_empty = 0  # 连续空提取次数
 
             while len(extracted_items) < target_count and scroll_count < max_scrolls:
+                # 标记DOM元素
+                dom_elements_result = await self.executor.mark_page_elements()
+                dom_elements = dom_elements_result.get('elements', [])
+
                 # 截图并解析
                 if use_omniparser:
                     screenshot_path, parse_resp = await self._capture_and_parse()
@@ -138,12 +143,13 @@ class ExtractionEngine:
 
                 current_url = await self.executor.get_url()
 
-                # 提取当前页面的列表项
+                # 提取当前页面的列表项（传入DOM元素列表）
                 list_data, list_debug = self.planner.extract_from_page(
                     task=task,
                     mode="list",
                     annotated_image_base64=image_base64,
                     current_url=current_url,
+                    elements=dom_elements,
                 )
 
                 items = list_data.get("items", [])
@@ -155,7 +161,7 @@ class ExtractionEngine:
                     errors.append(f"Full list_data: {list_data}")
                     items = []  # 清空以避免后续错误
 
-                # 过滤已见过的URL（去重）
+                # 过滤已见过的URL和Title（去重）
                 new_items = []
                 for item in items:
                     # 验证item类型
@@ -163,21 +169,31 @@ class ExtractionEngine:
                         errors.append(f"Skipping non-dict item (type: {type(item).__name__}): {item}")
                         continue
 
-                    # 如果有click_point，验证并保存（用于后续点击）
-                    if "click_point" in item and item["click_point"]:
-                        click_point = item["click_point"]
-                        # 验证click_point格式
-                        if isinstance(click_point, (list, tuple)) and len(click_point) == 2:
-                            try:
-                                x, y = int(click_point[0]), int(click_point[1])
-                                # 保存为元组
-                                item["_saved_click_point"] = (x, y)
-                            except (ValueError, TypeError) as e:
-                                errors.append(f"Warning: Invalid click_point format: {click_point}, error: {e}")
+                    # 如果有element_id，从DOM元素列表中提取href作为URL
+                    if "element_id" in item and item["element_id"]:
+                        element_id = item["element_id"]
+                        # 验证element_id是字符串
+                        if isinstance(element_id, str):
+                            item["_saved_element_id"] = element_id
+
+                            # 从DOM元素列表中查找对应的href
+                            for elem in dom_elements:
+                                if elem.get('id') == element_id:
+                                    href = elem.get('attributes', {}).get('href')
+                                    if href and not item.get("url"):
+                                        # 如果item没有URL，使用从DOM提取的href
+                                        item["url"] = href
+                                        logger.info(f"Extracted href from element {element_id}: {href}")
+                                    break
                         else:
-                            errors.append(f"Warning: click_point must be [x, y], got: {click_point}")
+                            errors.append(f"Warning: Invalid element_id format: {element_id}")
+
+                    # 保存标题用于重新查找元素（当页面重新加载后）
+                    if "title" in item and item["title"]:
+                        item["_saved_title"] = item["title"]
 
                     item_url = item.get("url", "")
+                    item_title = item.get("title", "")
 
                     # 标准化URL用于去重
                     normalized_url = item_url
@@ -189,15 +205,30 @@ class ExtractionEngine:
                         # 统一URL格式（去除尾部斜杠、转小写）
                         normalized_url = normalized_url.rstrip("/").lower()
 
-                    if normalized_url and normalized_url not in seen_urls:
-                        seen_urls.add(normalized_url)
+                    # 标准化Title用于去重（去除空格、转小写）
+                    normalized_title = item_title.strip().lower() if item_title else ""
+
+                    # 去重逻辑：检查 URL 或 Title
+                    is_duplicate = False
+                    if normalized_url and normalized_url in seen_urls:
+                        is_duplicate = True
+                    elif normalized_title and normalized_title in seen_titles:
+                        is_duplicate = True
+
+                    if not is_duplicate:
+                        # 添加到已见集合
+                        if normalized_url:
+                            seen_urls.add(normalized_url)
+                        if normalized_title:
+                            seen_titles.add(normalized_title)
+
                         # 补全item中的URL为完整URL
                         if item_url and item_url.startswith("/"):
                             from urllib.parse import urljoin
                             item["url"] = urljoin(current_url, item_url)
                         new_items.append(item)
-                    elif not item_url:
-                        # 没有URL的项目（可能有element_id用于点击，或者是评论等），直接添加
+                    # 如果既没有URL也没有Title，也添加（可能是特殊项目）
+                    elif not item_url and not item_title:
                         new_items.append(item)
 
                 if new_items:
@@ -237,18 +268,21 @@ class ExtractionEngine:
             if not list_only and extracted_items:
                 progress.append({"stage": "extract_details", "status": "running", "processed": 0})
 
+                # 保存列表页的 URL（在进入详情页之前）
+                list_page_url = await self.executor.get_url()
+
                 for idx, item in enumerate(extracted_items):
                     # 验证item类型
                     if not isinstance(item, dict):
                         errors.append(f"Item {idx} is not a dict (type: {type(item).__name__}): {item}")
                         continue
 
-                    # 检查是否有URL或click_point
+                    # 检查是否有URL或element_id
                     has_url = "url" in item and item["url"]
-                    has_click_point = "_saved_click_point" in item and item["_saved_click_point"]
+                    has_element_id = "_saved_element_id" in item and item["_saved_element_id"]
 
-                    if not has_url and not has_click_point:
-                        # 既没有URL也没有click_point，跳过
+                    if not has_url and not has_element_id:
+                        # 既没有URL也没有element_id，跳过
                         continue
 
                     try:
@@ -260,23 +294,98 @@ class ExtractionEngine:
                                 if not detail_url.startswith("http"):
                                     # 相对URL，补全
                                     from urllib.parse import urljoin
-                                    detail_url = urljoin(current_url, detail_url)
+                                    detail_url = urljoin(list_page_url, detail_url)
                                 progress[-1]["current_action"] = f"Navigating to {detail_url}"
                                 await self.executor.goto(detail_url)
                                 # 固定延迟
                                 await asyncio.sleep(2)
-                            elif has_click_point:
-                                # 使用VLM给出的坐标点击
-                                click_point = item["_saved_click_point"]
-                                x, y = click_point
-                                progress[-1]["current_action"] = f"Clicking at ({x}, {y})"
-                                await self.executor.click_center((x, y))
+                            elif has_element_id:
+                                # 使用DOM element_id点击
+                                # 参考Skyvern：在当前列表页重新标记并查找元素
+                                saved_title = item.get("_saved_title", "")
+                                saved_element_id = item["_saved_element_id"]
+
+                                logger.info(f"Attempting to click element for item: title='{saved_title}', saved_id={saved_element_id}")
+                                progress[-1]["current_action"] = f"Re-marking page to find element"
+
+                                # 重新标记当前页面（列表页）
+                                dom_elements_result = await self.executor.mark_page_elements()
+                                dom_elements = dom_elements_result.get('elements', [])
+                                logger.info(f"Re-marked page, found {len(dom_elements)} interactive elements")
+
+                                # 改进的元素匹配逻辑（参考Skyvern的哈希匹配思想）
+                                element_id = None
+                                best_match_score = 0
+
+                                if saved_title:
+                                    # 标准化saved_title用于匹配
+                                    saved_title_lower = saved_title.lower().strip()
+                                    saved_title_words = set(saved_title_lower.split())
+
+                                    for elem in dom_elements:
+                                        elem_text = elem.get('text', '').strip()
+                                        elem_text_lower = elem_text.lower()
+
+                                        # 计算匹配分数
+                                        score = 0
+
+                                        # 1. 完全匹配（最高优先级）
+                                        if saved_title_lower == elem_text_lower:
+                                            score = 100
+                                        # 2. 包含匹配
+                                        elif saved_title_lower in elem_text_lower:
+                                            score = 80
+                                        elif elem_text_lower in saved_title_lower:
+                                            score = 70
+                                        # 3. 词语重叠匹配
+                                        else:
+                                            elem_words = set(elem_text_lower.split())
+                                            common_words = saved_title_words & elem_words
+                                            if common_words and len(common_words) >= min(3, len(saved_title_words)):
+                                                score = 50 + len(common_words) * 5
+
+                                        # 4. 优先选择<a>标签
+                                        if score > 0 and elem.get('tag') == 'a':
+                                            score += 10
+
+                                        # 更新最佳匹配
+                                        if score > best_match_score:
+                                            best_match_score = score
+                                            element_id = elem.get('id')
+                                            logger.info(f"Found better match: id={element_id}, score={score}, text='{elem_text[:50]}'")
+
+                                if element_id and best_match_score >= 50:
+                                    logger.info(f"Using matched element {element_id} with score {best_match_score}")
+                                else:
+                                    # 匹配失败，跳过这个item
+                                    error_msg = f"Could not find reliable element match for title '{saved_title}' (best score: {best_match_score})"
+                                    logger.error(error_msg)
+                                    raise Exception(error_msg)
+
+                                progress[-1]["current_action"] = f"Clicking element {element_id}"
+
+                                # 点击并等待导航
+                                try:
+                                    # 使用DOM方法点击元素
+                                    success = await self.executor.click_element_by_id(element_id)
+                                    if not success:
+                                        raise Exception(f"Failed to click element {element_id}")
+                                    # 等待页面稳定
+                                    await asyncio.sleep(3)
+                                except Exception as e:
+                                    logger.error(f"Click navigation failed: {e}")
+                                    raise  # 重新抛出异常，让外层处理
 
                             # 参考 AutoGLM：固定延迟而不是等待页面加载
                             progress[-1]["current_action"] = "Waiting after navigation"
                             logger.info(f"Waiting 2 seconds after navigation (item {idx})")
                             await asyncio.sleep(2)  # 固定2秒延迟
                             logger.info(f"Wait completed (item {idx})")
+
+                            # 检查当前 URL，如果是 about:blank 说明导航失败
+                            current_check_url = await self.executor.get_url()
+                            if current_check_url == "about:blank" or not current_check_url:
+                                raise Exception(f"Navigation failed: page is blank (url: {current_check_url})")
 
                             # 截图并提取详情
                             progress[-1]["current_action"] = "Taking screenshot"
@@ -313,9 +422,9 @@ class ExtractionEngine:
                             # 返回列表页（如果需要继续提取）
                             if idx < len(extracted_items) - 1:
                                 if has_url:
-                                    # 使用URL导航，直接返回列表页
+                                    # 使用URL导航，返回到保存的列表页 URL
                                     progress[-1]["current_action"] = "Returning to list page"
-                                    await self.executor.goto(current_url)
+                                    await self.executor.goto(list_page_url)
                                 else:
                                     # 使用点击进入，需要后退
                                     progress[-1]["current_action"] = "Going back to list page"
@@ -329,11 +438,23 @@ class ExtractionEngine:
 
                     except asyncio.TimeoutError:
                         progress[-1]["current_action"] = f"Timeout at item {idx}"
-                        errors.append(f"Detail extraction timeout for item {idx} (url: {item.get('url', 'N/A')}, click_point: {item.get('_saved_click_point', 'N/A')})")
+                        errors.append(f"Detail extraction timeout for item {idx} (url: {item.get('url', 'N/A')}, element_id: {item.get('_saved_element_id', 'N/A')})")
+                        # 超时后尝试返回列表页
+                        try:
+                            await self.executor.goto(list_page_url)
+                            await asyncio.sleep(2)
+                        except:
+                            pass
                         continue
                     except Exception as exc:
                         progress[-1]["current_action"] = f"Error at item {idx}: {type(exc).__name__}"
-                        errors.append(f"Detail extraction failed for item {idx} (url: {item.get('url', 'N/A')}, click_point: {item.get('_saved_click_point', 'N/A')}): {type(exc).__name__}: {exc}")
+                        errors.append(f"Detail extraction failed for item {idx} (url: {item.get('url', 'N/A')}, element_id: {item.get('_saved_element_id', 'N/A')}): {type(exc).__name__}: {exc}")
+                        # 出错后尝试返回列表页
+                        try:
+                            await self.executor.goto(list_page_url)
+                            await asyncio.sleep(2)
+                        except:
+                            pass
                         continue
 
                 progress[-1]["status"] = "completed"
@@ -344,9 +465,12 @@ class ExtractionEngine:
             # 重置输出存储
             self.output_store.reset()
 
-            # 添加所有行
+            # 清理并添加所有行
             for item in extracted_items:
-                self.output_store.append_row(item)
+                # 创建清理后的副本，移除内部字段
+                cleaned_item = {k: v for k, v in item.items()
+                               if not k.startswith('_') and k not in ['click_point', 'element_id']}
+                self.output_store.append_row(cleaned_item)
 
             # 保存Excel
             if extracted_items:
@@ -358,7 +482,11 @@ class ExtractionEngine:
                 progress[-1]["reason"] = "no_items"
                 file_path = None
 
-            # 返回结果
+            # 返回结果（也清理返回的数据）
+            cleaned_items = [{k: v for k, v in item.items()
+                            if not k.startswith('_') and k not in ['click_point', 'element_id']}
+                           for item in extracted_items]
+
             status = "success" if len(extracted_items) >= target_count else "partial"
             if not extracted_items:
                 status = "failed"
@@ -370,7 +498,7 @@ class ExtractionEngine:
                 "file_path": os.path.basename(file_path) if file_path else None,
                 "progress": progress,
                 "errors": errors,
-                "items": extracted_items,  # 返回提取的数据供前端预览
+                "items": cleaned_items,  # 返回清理后的数据供前端预览
             }
 
         except Exception as exc:

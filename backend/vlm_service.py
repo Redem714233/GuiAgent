@@ -227,6 +227,7 @@ class VLMService:
         mode: str,
         annotated_image_base64: str,
         current_url: str,
+        elements: list = None,
     ) -> tuple[Dict[str, Any], str]:
         prompt = (
             "Extract structured data from the current page image for automation tasks. "
@@ -234,7 +235,18 @@ class VLMService:
             "If mode is 'list', return:\n"
             "{\n"
             "  'items': [\n"
-            "    {'title': str, 'url': str, 'click_point': [int, int], 'summary': str, 'time': str, 'author': str, 'rating': str, 'votes': str, ...},\n"
+            "    {\n"
+            "      'title': str,\n"
+            "      'url': str,\n"
+            "      'element_id': str,\n"
+            "      'confidence': float,  // 0.0-1.0, confidence in element_id selection\n"
+            "      'summary': str,\n"
+            "      'time': str,\n"
+            "      'author': str,\n"
+            "      'rating': str,\n"
+            "      'votes': str,\n"
+            "      ...\n"
+            "    },\n"
             "    ...\n"
             "  ],\n"
             "  'next': 'scroll' | 'next_page' | 'stop'\n"
@@ -242,12 +254,36 @@ class VLMService:
             "Field extraction rules (extract ONLY what is CLEARLY VISIBLE):\n"
             "- title: Main title/headline (required)\n"
             "- url: Link URL (ONLY if visible as text in the image)\n"
-            "- click_point: Click coordinates [x, y] in pixels (REQUIRED if url is not visible)\n"
-            "  * If URL is not visible as text, you MUST provide click_point to enable clicking\n"
-            "  * Analyze the image and determine the CENTER point of the clickable element\n"
-            "  * Return as a list of two integers: [x_coordinate, y_coordinate]\n"
-            "  * Example: [640, 320] means click at x=640, y=320\n"
-            "  * Choose the center of the title or main clickable area\n"
+            "- element_id: Unique element identifier from the provided elements list (REQUIRED for clickable items)\n"
+            "  * CRITICAL: Only select element IDs from the provided 'Available interactive elements' list below\n"
+            "  * DO NOT imagine or create new element IDs\n"
+            "  * Match the visible content (title, text) with the elements list\n"
+            "  * Return the element_id (e.g., 'skyvern-48') that corresponds to the MAIN/PRIMARY clickable item\n"
+            "  * Selection criteria (in priority order):\n"
+            "    1. Element text EXACTLY matches or CONTAINS the item title\n"
+            "    2. Element is an <a> tag (not <span>, <div>, or <button>)\n"
+            "    3. Element href points to the main content (not metadata pages)\n"
+            "    4. Element is LARGER in size (prefer width > 200px, height > 40px)\n"
+            "    5. Element is HIGHER in visual hierarchy (closer to top of the item)\n"
+            "  * AVOID selecting elements that are:\n"
+            "    - Metadata links: 'stars', 'stargazers', 'forks', 'watchers', 'issues', 'pull requests'\n"
+            "    - Social links: 'likes', 'comments', 'shares', 'follow', 'subscribe'\n"
+            "    - Statistics: 'views', 'ratings', 'reviews', 'votes'\n"
+            "    - Navigation: 'settings', 'profile', 'logout', 'help'\n"
+            "    - Small elements (width < 100px or height < 30px) unless it's the only option\n"
+            "  * If multiple elements match, choose the one with the LONGEST matching text\n"
+            "  * Example: For 'bytedance/UI-TARS-desktop', if you see:\n"
+            "    - skyvern-48 (a): \"bytedance/UI-TARS-desktop\" [href: /bytedance/UI-TARS-desktop] ✓ CORRECT\n"
+            "    - skyvern-102 (a): \"233 stars\" [href: /bytedance/UI-TARS-desktop/stargazers] ✗ WRONG (metadata)\n"
+            "    Choose skyvern-48 because it's the main title link, not metadata\n"
+            "- confidence: Confidence score (0.0-1.0) for the element_id selection (REQUIRED if element_id is provided)\n"
+            "  * 1.0 = Perfect match (element text exactly matches title, correct tag type, appropriate size)\n"
+            "  * 0.8-0.9 = Good match (element text contains title, correct tag, good size)\n"
+            "  * 0.6-0.7 = Acceptable match (partial text match, may be smaller or different tag)\n"
+            "  * 0.4-0.5 = Uncertain match (weak text match, small element, or metadata concern)\n"
+            "  * < 0.4 = Poor match (should avoid using this element)\n"
+            "  * Use this to indicate your confidence in the element selection\n"
+            "  * If confidence < 0.6, consider if there's a better element in the list\n"
             "- summary: Brief description/plot summary (NOT metadata like director, cast, year)\n"
             "- time: Publication date, upload time, or release year\n"
             "- author: Author name, director name, or channel name\n"
@@ -291,11 +327,12 @@ class VLMService:
             "- For URLs: ABSOLUTELY FORBIDDEN to fabricate URLs. Only include if you can see the EXACT URL text in the image.\n"
             "  * DO NOT generate URLs based on patterns (e.g., doc-imkzueyv9876545.shtml)\n"
             "  * DO NOT infer URLs from titles or other content\n"
-            "  * If URL is not visible as text, you MUST omit the 'url' field and provide 'click_point' instead\n"
-            "- For click_point: REQUIRED if URL is not visible - provide [x, y] coordinates in pixels\n"
-            "  * Analyze the visual layout and identify the CENTER of the clickable element\n"
-            "  * Return as [x, y] where both are integers\n"
-            "  * Be as accurate as possible based on the visual appearance\n"
+            "  * If URL is not visible as text, you MUST omit the 'url' field and provide 'element_id' instead\n"
+            "- For element_id: REQUIRED if item is clickable - match the visible content with the provided elements list\n"
+            "  * Look at the elements list provided in the context\n"
+            "  * Find the element whose text matches the title or clickable content\n"
+            "  * Return the element's unique_id (e.g., 'skyvern-48')\n"
+            "  * Be precise in matching - use the text content to identify the correct element\n"
             "- Separate metadata from content (don't mix director/cast into summary)\n"
             "- Extract numbers without units when possible (rating: '9.7' not '★★★★☆ 9.7')\n"
             "- Each field should contain ONLY its designated data type (don't mix fields)\n"
@@ -327,6 +364,24 @@ class VLMService:
             "- Return empty items/data if nothing relevant is found"
         )
         user_payload = {"task": task, "mode": mode, "url": current_url}
+
+        # Add elements list if provided
+        if elements:
+            # Build a simplified elements text for VLM
+            elements_text = "Available interactive elements:\n"
+            for elem in elements[:50]:  # Limit to first 50 elements to avoid token overflow
+                elem_id = elem.get('id', '')
+                tag = elem.get('tagName', '')
+                text = elem.get('text', '')[:100]  # Limit text length
+                href = elem.get('attributes', {}).get('href', '')
+
+                elements_text += f"- {elem_id} ({tag}): \"{text}\""
+                if href:
+                    elements_text += f" [href: {href}]"
+                elements_text += "\n"
+
+            user_payload["elements"] = elements_text
+
         data_url = f"data:image/png;base64,{annotated_image_base64}"
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -343,5 +398,89 @@ class VLMService:
             ],
             temperature=0.1,
         )
+        content = resp.choices[0].message.content or ""
+        return self._extract_json(content), content
+
+    def get_next_action(
+        self,
+        *,
+        task: str,
+        screenshot_base64: str,
+        current_url: str,
+        step_count: int,
+        context: str = "",
+    ) -> tuple[dict, str]:
+        """
+        获取下一步动作（用于 WebAgent）
+
+        参考 AutoGLM 的提示词格式，返回动作字符串
+
+        Args:
+            task: 用户任务描述
+            screenshot_base64: 当前页面截图（base64）
+            current_url: 当前URL
+            step_count: 当前步数
+            context: 历史上下文（可选）
+
+        Returns:
+            ({"action": str, "thinking": str}, raw_response)
+        """
+        prompt = (
+            "You are a web automation agent. Analyze the screenshot and decide the next action.\n\n"
+            "Available actions:\n"
+            "1. do(action=\"Tap\", element=[x, y]) - Click at relative coordinates (0-1000 range)\n"
+            "   - x, y are relative coordinates from 0 to 1000\n"
+            "   - Example: do(action=\"Tap\", element=[500, 300])\n\n"
+            "2. do(action=\"Type\", text=\"...\") - Type text into focused input\n"
+            "   - Example: do(action=\"Type\", text=\"search query\")\n\n"
+            "3. do(action=\"Scroll\", direction=\"down\"|\"up\") - Scroll the page\n"
+            "   - Example: do(action=\"Scroll\", direction=\"down\")\n\n"
+            "4. do(action=\"Wait\", duration=\"N seconds\") - Wait for N seconds\n"
+            "   - Example: do(action=\"Wait\", duration=\"2 seconds\")\n\n"
+            "5. do(action=\"Extract\", fields=[\"field1\", \"field2\"]) - Extract data from current page\n"
+            "   - Use this when you need to extract structured data\n"
+            "   - Specify which fields to extract (e.g., [\"title\", \"rating\", \"author\"])\n"
+            "   - Example: do(action=\"Extract\", fields=[\"title\", \"rating\"])\n\n"
+            "6. finish(message=\"...\") - Complete the task with a message\n"
+            "   - Example: finish(message=\"Task completed successfully\")\n\n"
+            "IMPORTANT:\n"
+            "- Use relative coordinates (0-1000) for Tap action\n"
+            "- Use Extract action when the task asks to \"extract\", \"get\", \"collect\" data\n"
+            "- Analyze the screenshot carefully before deciding\n"
+            "- Return ONLY the action in the exact format shown above\n"
+            "- Do NOT add any explanation or commentary\n\n"
+            "Return JSON format:\n"
+            "{\n"
+            "  \"thinking\": \"Your analysis of the current state\",\n"
+            "  \"action\": \"do(action=\\\"Tap\\\", element=[500, 300])\" or \"do(action=\\\"Extract\\\", fields=[\\\"title\\\", \\\"rating\\\"])\" or \"finish(message=\\\"...\\\")\"\n"
+            "}\n"
+        )
+
+        user_payload = {
+            "task": task,
+            "current_url": current_url,
+            "step": step_count,
+        }
+        if context:
+            user_payload["context"] = context
+
+        data_url = f"data:image/png;base64,{screenshot_base64}"
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)},
+                    ],
+                },
+            ],
+            temperature=0.1,
+        )
+
         content = resp.choices[0].message.content or ""
         return self._extract_json(content), content

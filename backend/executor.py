@@ -23,6 +23,17 @@ class Executor:
         self._viewport_height = int(os.getenv("PLAYWRIGHT_VIEWPORT_HEIGHT", "720"))
         self._device_scale_factor = float(os.getenv("PLAYWRIGHT_DEVICE_SCALE_FACTOR", "1"))
 
+        # DOM 服务（延迟初始化）
+        self._dom_service = None
+
+    @property
+    def dom_service(self):
+        """延迟初始化 DOM 服务"""
+        if self._dom_service is None:
+            from .dom_service import DOMService
+            self._dom_service = DOMService()
+        return self._dom_service
+
     def _on_new_page(self, page) -> None:
         # If navigation opens a new tab/window, switch to it for subsequent actions/screenshot.
         self._page = page
@@ -302,3 +313,306 @@ class Executor:
             except Exception:
                 continue
         return results
+
+    # ========================================================================
+    # 新增方法：支持更多动作类型
+    # ========================================================================
+
+    async def upload_file(self, file_path: str, selector: str = 'input[type="file"]') -> None:
+        """
+        上传文件到文件输入框
+
+        Args:
+            file_path: 本地文件路径
+            selector: 文件输入框的选择器
+        """
+        await self._ensure_page()
+        try:
+            # 查找文件输入框
+            file_input = await self._page.query_selector(selector)
+            if not file_input:
+                raise ValueError(f"File input not found with selector: {selector}")
+
+            # 设置文件
+            await file_input.set_input_files(file_path)
+            logger.info(f"Uploaded file: {file_path}")
+        except Exception as e:
+            logger.error(f"File upload failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            file_input = await self._page.query_selector(selector)
+            if file_input:
+                await file_input.set_input_files(file_path)
+
+    async def download_file(self, download_url: str, save_path: str) -> None:
+        """
+        下载文件
+
+        Args:
+            download_url: 下载链接
+            save_path: 保存路径
+        """
+        await self._ensure_page()
+        try:
+            # 等待下载事件
+            async with self._page.expect_download() as download_info:
+                # 触发下载（导航到下载链接）
+                await self._page.goto(download_url)
+
+            download = await download_info.value
+            # 保存文件
+            await download.save_as(save_path)
+            logger.info(f"Downloaded file to: {save_path}")
+        except Exception as e:
+            logger.error(f"File download failed: {e}")
+            raise
+
+    async def select_option(self, selector: str, value: str = None, label: str = None, index: int = None) -> None:
+        """
+        选择下拉框选项
+
+        Args:
+            selector: 下拉框选择器
+            value: 选项的 value 属性
+            label: 选项的文本
+            index: 选项的索引
+        """
+        await self._ensure_page()
+        try:
+            if value is not None:
+                await self._page.select_option(selector, value=value)
+            elif label is not None:
+                await self._page.select_option(selector, label=label)
+            elif index is not None:
+                await self._page.select_option(selector, index=index)
+            else:
+                raise ValueError("Must provide value, label, or index")
+
+            logger.info(f"Selected option in {selector}")
+        except Exception as e:
+            logger.error(f"Select option failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            if value is not None:
+                await self._page.select_option(selector, value=value)
+            elif label is not None:
+                await self._page.select_option(selector, label=label)
+            elif index is not None:
+                await self._page.select_option(selector, index=index)
+
+    async def checkbox(self, selector: str, checked: bool) -> None:
+        """
+        设置复选框状态
+
+        Args:
+            selector: 复选框选择器
+            checked: 目标状态（True=选中，False=未选中）
+        """
+        await self._ensure_page()
+        try:
+            checkbox_element = await self._page.query_selector(selector)
+            if not checkbox_element:
+                raise ValueError(f"Checkbox not found with selector: {selector}")
+
+            # 检查当前状态
+            is_checked = await checkbox_element.is_checked()
+
+            # 如果状态不匹配，点击切换
+            if is_checked != checked:
+                await checkbox_element.click()
+
+            logger.info(f"Set checkbox {selector} to {checked}")
+        except Exception as e:
+            logger.error(f"Checkbox operation failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            checkbox_element = await self._page.query_selector(selector)
+            if checkbox_element:
+                is_checked = await checkbox_element.is_checked()
+                if is_checked != checked:
+                    await checkbox_element.click()
+
+    async def hover(self, x: int, y: int, hold_seconds: float = 0.0) -> None:
+        """
+        悬停在指定位置
+
+        Args:
+            x: X 坐标
+            y: Y 坐标
+            hold_seconds: 悬停持续时间（秒）
+        """
+        await self._ensure_page()
+        try:
+            await self._page.mouse.move(x, y)
+            if hold_seconds > 0:
+                await asyncio.sleep(hold_seconds)
+            logger.info(f"Hovered at ({x}, {y}) for {hold_seconds}s")
+        except Exception as e:
+            logger.error(f"Hover failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            await self._page.mouse.move(x, y)
+            if hold_seconds > 0:
+                await asyncio.sleep(hold_seconds)
+
+    async def press_keys(self, keys: list[str], hold: bool = False) -> None:
+        """
+        按下键盘按键（支持组合键）
+
+        Args:
+            keys: 按键列表，例如 ["Control", "c"] 表示 Ctrl+C
+            hold: 是否按住不放
+        """
+        await self._ensure_page()
+        try:
+            if len(keys) == 1:
+                # 单个按键
+                if hold:
+                    await self._page.keyboard.down(keys[0])
+                else:
+                    await self._page.keyboard.press(keys[0])
+            else:
+                # 组合键：按住前面的键，按下最后一个键
+                for key in keys[:-1]:
+                    await self._page.keyboard.down(key)
+
+                await self._page.keyboard.press(keys[-1])
+
+                # 释放前面的键
+                for key in reversed(keys[:-1]):
+                    await self._page.keyboard.up(key)
+
+            logger.info(f"Pressed keys: {keys}")
+        except Exception as e:
+            logger.error(f"Press keys failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            # 重试逻辑
+            if len(keys) == 1:
+                await self._page.keyboard.press(keys[0])
+            else:
+                for key in keys[:-1]:
+                    await self._page.keyboard.down(key)
+                await self._page.keyboard.press(keys[-1])
+                for key in reversed(keys[:-1]):
+                    await self._page.keyboard.up(key)
+
+    async def move_mouse(self, x: int, y: int) -> None:
+        """
+        移动鼠标到指定位置
+
+        Args:
+            x: X 坐标
+            y: Y 坐标
+        """
+        await self._ensure_page()
+        try:
+            await self._page.mouse.move(x, y)
+            logger.info(f"Moved mouse to ({x}, {y})")
+        except Exception as e:
+            logger.error(f"Move mouse failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            await self._page.mouse.move(x, y)
+
+    async def drag(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
+        """
+        拖拽操作
+
+        Args:
+            start_x: 起始 X 坐标
+            start_y: 起始 Y 坐标
+            end_x: 结束 X 坐标
+            end_y: 结束 Y 坐标
+        """
+        await self._ensure_page()
+        try:
+            # 移动到起始位置
+            await self._page.mouse.move(start_x, start_y)
+            # 按下鼠标
+            await self._page.mouse.down()
+            # 移动到结束位置
+            await self._page.mouse.move(end_x, end_y)
+            # 释放鼠标
+            await self._page.mouse.up()
+            logger.info(f"Dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})")
+        except Exception as e:
+            logger.error(f"Drag failed: {e}")
+            await self._restart()
+            await self._ensure_page()
+            await self._page.mouse.move(start_x, start_y)
+            await self._page.mouse.down()
+            await self._page.mouse.move(end_x, end_y)
+            await self._page.mouse.up()
+
+    async def reload(self) -> None:
+        """刷新当前页面"""
+        await self._ensure_page()
+        try:
+            await self._page.reload(timeout=30000, wait_until="domcontentloaded")
+            logger.info("Page reloaded")
+        except Exception as e:
+            logger.warning(f"Page reload timeout or error: {e}, continuing anyway")
+
+    async def close_page(self) -> None:
+        """关闭当前页面"""
+        await self._ensure_page()
+        try:
+            await self._page.close()
+            self._page = None
+            logger.info("Page closed")
+        except Exception as e:
+            logger.error(f"Close page failed: {e}")
+
+    def get_viewport_size(self) -> Tuple[int, int]:
+        """
+        获取视口大小
+
+        Returns:
+            (width, height) 元组
+        """
+        return (self._viewport_width, self._viewport_height)
+
+    # ========================================================================
+    # DOM 元素定位方法（基于 Skyvern）
+    # ========================================================================
+
+    async def mark_page_elements(self) -> dict:
+        """
+        标记页面上的所有可交互元素
+
+        Returns:
+            {
+                'elements': [...],  # 元素列表
+                'count': int,       # 元素数量
+                'viewport': {...}   # 视口信息
+            }
+        """
+        await self._ensure_page()
+        return await self.dom_service.mark_page_elements(self._page)
+
+    async def click_element_by_id(self, element_id: str) -> bool:
+        """
+        通过 unique_id 点击元素
+
+        Args:
+            element_id: 元素的 unique_id
+
+        Returns:
+            是否成功点击
+        """
+        await self._ensure_page()
+        return await self.dom_service.click_element_by_id(self._page, element_id)
+
+    async def get_element_center(self, element_id: str) -> Optional[dict]:
+        """
+        获取元素的中心坐标
+
+        Args:
+            element_id: 元素的 unique_id
+
+        Returns:
+            {'x': int, 'y': int} 或 None
+        """
+        await self._ensure_page()
+        return await self.dom_service.get_element_center(self._page, element_id)

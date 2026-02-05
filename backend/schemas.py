@@ -131,7 +131,7 @@ class RunExtractionRequest(BaseModel):
     task: str
     max_items: int = Field(10, ge=1, le=100)
     strategy: Optional[dict] = None
-    use_omniparser: bool = Field(True, description="是否使用OmniParser标注图片（False则使用原始截图）")
+    use_omniparser: bool = Field(False, description="是否使用OmniParser标注图片（False则使用原始截图）")
 
 
 class RunExtractionResponse(BaseModel):

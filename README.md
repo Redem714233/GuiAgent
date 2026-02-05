@@ -1,65 +1,215 @@
 # GUIAgent - 智能浏览器自动化系统
 
+## 🎉 v2.1 最新更新 (2026-02-05)
+
+**DOM-based 元素定位系统（参考Skyvern架构）**
+
+- ✅ **智能href提取**：从DOM元素自动提取href，避免element_id失效
+- ✅ **优先URL导航**：详情页提取使用goto(url)而不是点击，更稳定可靠
+- ✅ **智能元素匹配**：评分算法（完全匹配100分、包含匹配80分、词语重叠50+分）
+- ✅ **多层点击回退**：JavaScript click → 坐标点击 → Playwright locator
+- ✅ **延迟初始化**：OmniParser按需加载，避免启动时下载模型
+
+**核心改进**：解决了页面重新加载后element_id失效导致点击失败的问题，参考Skyvern的设计理念但实现更简洁。
+
+---
+
+## 🎉 v2.0 重大更新
+
+**基于 Skyvern 架构模式的全面升级！**
+
+- ✅ **21 种动作类型**（从 6 种增加到 21 种）
+- ✅ **类型安全的 Action 系统**（Pydantic 模型）
+- ✅ **完善的错误处理**（自动重试 + 指数退避）
+- ✅ **10+ 新增 Executor 方法**（文件上传/下载、表单操作、拖拽等）
+- ✅ **完整的文档**（架构文档 + 使用指南 + 示例代码）
+
+📖 **快速开始**: [使用指南](docs/USER_GUIDE.md) | [架构文档](backend/README.md) | [改进报告](docs/FINAL_REPORT.md)
+
+---
+
 ## 项目简介
-一个基于视觉理解的GUI自动化系统，能够自动操作浏览器完成复杂任务，如数据提取、网页导航等。
+
+一个基于视觉理解的 GUI 自动化系统，能够自动操作浏览器完成复杂任务，如数据提取、网页导航等。
+
+**核心架构**（参考 [Open-AutoGLM](https://github.com/zai-org/Open-AutoGLM) + [Skyvern](https://github.com/Skyvern-AI/skyvern)）:
+- **循环决策架构**: 截图 → VLM推理 → 解析动作 → 执行动作 → 循环
+- **DOM-based 元素定位**: 使用JavaScript标记可交互元素，分配unique_id（参考Skyvern）
+- **智能href提取**: 从DOM元素提取href作为URL，避免element_id失效问题
+- **类型安全的 Action 系统**: 使用 Pydantic 模型定义所有动作
+- **相对坐标系统**: 使用 0-1000 范围的相对坐标，更稳定可靠
+- **固定延迟策略**: 每个操作后固定延迟，不依赖复杂的页面加载等待
+- **错误重试机制**: 自动重试失败的动作，指数退避策略
 
 **核心技术栈**:
-- **OmniParser**: YOLO + OCR + Florence2 实现屏幕元素识别
+- **DOM Marking System**: JavaScript注入标记可交互元素（参考Skyvern架构）
+- **OmniParser**: YOLO + OCR + Florence2 实现屏幕元素识别（可选）
 - **VLM (Qwen3-VL)**: 视觉语言模型进行决策和数据提取
 - **Playwright**: 浏览器自动化执行
 - **FastAPI**: 后端服务
 - **React**: 前端交互界面
 
-## Setup
-Create/activate your Python env, then install deps:
+---
 
-```powershell
+## 🚀 快速开始
+
+### 1. 安装依赖
+
+```bash
 pip install -r requirements.txt
 python -m playwright install
 ```
 
-If you need extra DLL paths (CUDA/cuDNN), set:
+### 2. 配置环境变量
 
-```powershell
-$env:OMNIPARSER_EXTRA_PATHS="C:\path\to\env\bin;C:\path\to\env\Library\bin"
+编辑 `.env` 文件：
+
+```env
+# VLM 配置（DashScope Qwen3-VL）
+VLM_PROVIDER=dashscope
+VLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+VLM_MODEL=qwen3-vl-flash
+VLM_API_KEY=你的API密钥
+
+# 浏览器配置
+PLAYWRIGHT_CHANNEL=msedge
+PLAYWRIGHT_VIEWPORT_WIDTH=1280
+PLAYWRIGHT_VIEWPORT_HEIGHT=720
 ```
 
-Ensure your OpenAI key is set:
+### 3. 启动服务
 
-```powershell
-$env:OPENAI_API_KEY="your_key_here"
+**⚠️ 重要：必须从项目根目录启动！**
+
+**后端**（从项目根目录 `GUIagent` 运行）:
+```bash
+# 方式 1: 使用启动脚本（推荐）
+python start_backend.py
+
+# 方式 2: 使用 uvicorn 命令
+python -m uvicorn backend.server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Optional: run Playwright on Edge
-
-```powershell
-$env:PLAYWRIGHT_CHANNEL="msedge"
-# or use explicit path
-$env:PLAYWRIGHT_EXECUTABLE="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+**前端**:
+```bash
+cd ui
+npm install
+npm run dev
 ```
 
-## Run
+访问：
+- 前端：http://localhost:5173
+- 后端 API：http://localhost:8000
+- API 文档：http://localhost:8000/docs
 
-```powershell
-python -m uvicorn backend.server:app --host 127.0.0.1 --port 8000
+---
+
+## 🎯 核心功能
+
+### 支持的动作类型（21 种）
+
+| 类别 | 动作类型 | 说明 |
+|------|---------|------|
+| **基础交互** | ClickAction | 点击元素（支持单击/双击/三击） |
+| | InputTextAction | 输入文本 |
+| | UploadFileAction | 上传文件 ✨ |
+| | DownloadFileAction | 下载文件 ✨ |
+| **表单操作** | SelectOptionAction | 下拉选择 ✨ |
+| | CheckboxAction | 复选框切换 ✨ |
+| **导航控制** | GotoUrlAction | 导航到 URL |
+| | ScrollAction | 滚动页面 |
+| | WaitAction | 等待 |
+| | ReloadPageAction | 刷新页面 ✨ |
+| | ClosePageAction | 关闭页面 ✨ |
+| **高级交互** | HoverAction | 悬停 ✨ |
+| | KeypressAction | 按键（支持组合键）✨ |
+| | MoveAction | 鼠标移动 ✨ |
+| | DragAction | 拖拽 ✨ |
+| **数据提取** | ExtractAction | 提取数据 |
+| **任务控制** | CompleteAction | 任务完成 |
+| | TerminateAction | 任务终止 |
+| | NullAction | 空操作 |
+| **特殊功能** | SolveCaptchaAction | 验证码求解 |
+| | VerificationCodeAction | 验证码输入 |
+
+✨ = v2.0 新增
+
+---
+
+## 💡 使用示例
+
+### Python 后端使用
+
+```python
+from backend.actions.actions import ClickAction, InputTextAction
+from backend.actions.handler import ActionHandler
+from backend.executor import Executor
+
+# 创建执行器和处理器
+executor = Executor()
+await executor.start()
+
+handler = ActionHandler(
+    executor,
+    action_delay=2.0,  # 每个动作后延迟 2 秒
+    max_retries=3      # 失败时重试 3 次
+)
+
+# 方式 1: 使用新的 Action 对象（推荐）
+action = ClickAction(
+    element_id="button_123",
+    x=500,
+    y=300,
+    reasoning="点击提交按钮",
+    confidence_float=0.95
+)
+
+# 执行动作（带自动重试）
+result = await handler.execute_with_retry(action)
+
+# 方式 2: 使用旧格式（向后兼容）
+legacy_action = {
+    "_metadata": "do",
+    "action": "Tap",
+    "element": [500, 300]
+}
+
+result = await handler.execute(legacy_action)
 ```
 
-## API
+### 完整工作流示例
 
-- `POST /parse` with JSON body:
-  - `image_path` or `image_base64` (PNG/JPG)
-  - returns `elements[]` and `annotated_image_base64`
-- `POST /plan` with `{ task, elements[] }`
-- `POST /step` with `{ task }` or `{ task, override_point: [x,y] }`
-- `POST /task_spec` with `{ task }` returns a task specification JSON
-- `POST /extract` with `{ task, spec, mode }` returns extracted list/detail data (image-based)
-- `POST /append_row` with `{ row }` appends a row to the in-memory output table
-- `POST /save_output` with `{ file_name? }` writes Excel to `data/outputs/` (no overwrite)
-- `GET /files` lists output files
-- `GET /files/{name}` downloads a file
+```python
+from backend.actions.actions import *
 
-## Output files
-Excel outputs are saved under `data/outputs/` with timestamp+UUID names by default. Existing files are never overwritten.
+workflow = [
+    GotoUrlAction(url="https://example.com/login"),
+    WaitAction(seconds=2.0),
+    ClickAction(element_id="username", x=400, y=200),
+    InputTextAction(element_id="username", text="user@example.com"),
+    ClickAction(element_id="password", x=400, y=250),
+    InputTextAction(element_id="password", text="password123"),
+    ClickAction(element_id="login_btn", x=400, y=300),
+    WaitAction(seconds=3.0),
+    ExtractAction(data_extraction_goal="提取用户信息"),
+    CompleteAction(description="登录成功", verified=True)
+]
+
+for action in workflow:
+    result = await handler.execute_with_retry(action)
+    if result.should_finish:
+        break
+```
+
+---
+
+## 📚 文档
+
+- 📖 [使用指南](docs/USER_GUIDE.md) - 快速上手指南
+- 🏗️ [后端架构](backend/README.md) - 后端架构文档
+- 📊 [改进分析](docs/IMPROVEMENTS.md) - 详细的改进分析
+- 📝 [最终报告](docs/FINAL_REPORT.md) - 完整的改进报告
+- 💻 [代码示例](docs/examples/action_system_examples.py) - 使用示例
 
 ---
 
@@ -83,7 +233,43 @@ VLM规划步骤 (plan_steps)
 
 ### 关键设计决策
 
-#### 1. 视觉优先策略
+#### 1. DOM-based 元素定位系统（参考Skyvern）
+**问题**: 页面重新加载后，element_id会失效，导致点击失败。
+
+**解决方案**:
+- **JavaScript DOM标记**: 使用 `dom_marker.js` 注入JavaScript，为所有可交互元素分配 `unique_id`
+- **智能href提取**: 当VLM返回element_id时，自动从DOM元素中提取href属性作为URL
+- **优先URL导航**: 详情页提取时优先使用 `goto(url)` 而不是点击，避免element_id失效
+- **智能元素匹配**: 如果必须点击，使用评分算法（完全匹配100分、包含匹配80分、词语重叠50+分）重新定位元素
+- **多层点击回退**: JavaScript click → 坐标点击 → Playwright locator
+
+**核心流程**:
+```python
+# 1. 列表提取阶段：从element_id提取href
+if "element_id" in item:
+    for elem in dom_elements:
+        if elem['id'] == element_id:
+            href = elem['attributes']['href']
+            item["url"] = href  # 保存为URL
+
+# 2. 详情提取阶段：优先使用URL导航
+if has_url:
+    await executor.goto(detail_url)  # 直接导航，避免element_id失效
+elif has_element_id:
+    # 备用方案：重新匹配并点击
+    element_id = smart_match_by_title(saved_title, dom_elements)
+    await executor.click_element_by_id(element_id)
+```
+
+**代码位置**:
+- [backend/dom_marker.js](backend/dom_marker.js) - DOM标记和元素提取
+- [backend/dom_service.py](backend/dom_service.py) - DOM服务封装
+- [backend/extraction_engine.py](backend/extraction_engine.py:172-194) - href提取逻辑
+- [backend/extraction_engine.py](backend/extraction_engine.py:303-350) - 智能元素匹配
+
+**参考**: Skyvern使用SHA256哈希匹配元素，我们使用更简单的href提取方案，效果相同但实现更简洁。
+
+#### 2. 视觉优先策略
 **问题**: Florence2生成的元素文本描述存在偏差，容易误导VLM点击错误元素。
 
 **解决方案**:
@@ -95,7 +281,7 @@ VLM规划步骤 (plan_steps)
 - [backend/vlm_service.py](backend/vlm_service.py) - VLM决策提示词强调"image as primary source"
 - [backend/planner.py](backend/planner.py:85) - 支持禁用元素列表
 
-#### 2. 工具化动作系统
+#### 3. 工具化动作系统
 支持多种动作类型：`click`, `type`, `press`, `wait`, `copy`, `goto`, `scroll`
 
 每个动作可携带参数：
@@ -111,6 +297,9 @@ VLM规划步骤 (plan_steps)
 GUIAgent/
 ├── backend/              # FastAPI后端
 │   ├── server.py        # API端点
+│   ├── dom_marker.js    # DOM元素标记（JavaScript）
+│   ├── dom_service.py   # DOM服务封装
+│   ├── extraction_engine.py  # 数据提取引擎
 │   ├── omniparser_service.py  # OmniParser封装
 │   ├── vlm_service.py   # VLM服务（Qwen3-VL）
 │   ├── planner.py       # 任务规划器
@@ -388,6 +577,24 @@ A:
 - **当前限制**：`/run_extraction` 仅支持URL可见的场景（如新闻列表）
 - **解决方案1**：使用交互式流程（"Run"按钮 + "下一步"），让VLM通过点击进入详情页
 - **解决方案2**（未来）：增强提取引擎支持点击操作（需要开发）
+
+### Q: Element ID失效导致点击失败怎么办？
+A:
+- **已解决**：系统现在使用智能href提取机制（参考Skyvern架构）
+- **工作原理**：
+  1. VLM返回element_id时，自动从DOM元素中提取href
+  2. 详情页提取时优先使用goto(url)导航，而不是点击
+  3. 如果必须点击，使用智能匹配算法（评分系统）重新定位元素
+- **备用方案**：多层点击回退（JavaScript → 坐标 → Playwright locator）
+- **参考代码**：[backend/extraction_engine.py](backend/extraction_engine.py:172-194)
+
+### Q: DOM标记系统如何工作？
+A:
+- **JavaScript注入**：使用 `dom_marker.js` 标记所有可交互元素
+- **unique_id分配**：每个元素获得唯一ID（如 `skyvern-48`）
+- **优先级排序**：主要内容链接排在前面，避免VLM选择错误元素
+- **元素信息提取**：标签名、文本、href、位置、大小等
+- **参考代码**：[backend/dom_marker.js](backend/dom_marker.js)
 
 ---
 

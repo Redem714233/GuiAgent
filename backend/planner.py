@@ -475,6 +475,7 @@ class Planner:
         mode: str,
         annotated_image_base64: str,
         current_url: str,
+        elements: list = None,
     ) -> tuple[dict, dict]:
         if self._vlm_provider in {"qwen3-vl", "dashscope"}:
             if self._vlm is None:
@@ -486,11 +487,12 @@ class Planner:
                 mode=mode,
                 annotated_image_base64=annotated_image_base64,
                 current_url=current_url,
+                elements=elements,
             )
             debug = {
                 "provider": self._vlm_provider,
                 "model": os.getenv("VLM_MODEL", ""),
-                "request": {"task": task, "mode": mode, "url": current_url, "image": True},
+                "request": {"task": task, "mode": mode, "url": current_url, "image": True, "elements_count": len(elements) if elements else 0},
                 "response": resp,
                 "response_raw": raw,
             }

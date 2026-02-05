@@ -11,16 +11,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from backend.executor import Executor
-from backend.omniparser_service import OmniParserService
-from backend.planner import Planner
-from backend.schemas import ParseRequest, ParseResponse, PlanRequest, PlanResponse, StepRequest, StepResponse
-from backend.schemas import Element, PlanStepsRequest, PlanStepsResponse
-from backend.schemas import TaskSpec, ExtractRequest, ExtractResponse, AppendRowRequest, AppendRowResponse
-from backend.schemas import SaveOutputResponse, FileListResponse, RunExtractionRequest, RunExtractionResponse
-from backend.output_store import OutputStore
-from backend.storage import ensure_dir, timestamp_name
-from backend.extraction_engine import ExtractionEngine
+from .executor import Executor
+from .omniparser_service import OmniParserService
+from .planner import Planner
+from .schemas import ParseRequest, ParseResponse, PlanRequest, PlanResponse, StepRequest, StepResponse
+from .schemas import Element, PlanStepsRequest, PlanStepsResponse
+from .schemas import TaskSpec, ExtractRequest, ExtractResponse, AppendRowRequest, AppendRowResponse
+from .schemas import SaveOutputResponse, FileListResponse, RunExtractionRequest, RunExtractionResponse
+from .output_store import OutputStore
+from .storage import ensure_dir, timestamp_name
+from .extraction_engine import ExtractionEngine
 
 load_dotenv()
 
@@ -34,9 +34,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-parser_service = OmniParserService()
+parser_service = None  # 延迟初始化，避免启动时加载 Florence-2
 planner = Planner()
 executor = Executor()
+
+def get_parser_service():
+    """延迟初始化 OmniParser 服务"""
+    global parser_service
+    if parser_service is None:
+        parser_service = OmniParserService()
+    return parser_service
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../data", "screenshots"))
 ensure_dir(DATA_DIR)
@@ -47,7 +54,7 @@ output_store = OutputStore(OUTPUT_DIR)
 
 extraction_engine = ExtractionEngine(
     executor=executor,
-    parser_service=parser_service,
+    parser_service=None,  # 延迟初始化
     planner=planner,
     output_store=output_store,
     data_dir=DATA_DIR,
@@ -56,7 +63,7 @@ extraction_engine = ExtractionEngine(
 
 @app.post("/parse", response_model=ParseResponse)
 def parse(request: ParseRequest) -> ParseResponse:
-    return parser_service.parse(request)
+    return get_parser_service().parse(request)
 
 
 @app.post("/plan", response_model=PlanResponse)
@@ -69,7 +76,7 @@ async def _capture_and_parse() -> tuple[str, ParseResponse]:
     await executor.screenshot(screenshot_path)
     with open(screenshot_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("ascii")
-    parse_resp = parser_service.parse(ParseRequest(image_base64=image_b64, use_paddleocr=True))
+    parse_resp = get_parser_service().parse(ParseRequest(image_base64=image_b64, use_paddleocr=True))
     return screenshot_path, parse_resp
 
 
