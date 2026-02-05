@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useMemo, useRef, useState, useEffect } from "react";
 
 const API_BASE = "http://127.0.0.1:8000";
 
@@ -75,7 +75,9 @@ function App() {
   const [maxItems, setMaxItems] = useState<number>(10);
   const [useOmniparser, setUseOmniparser] = useState<boolean>(true);
   const [listOnly, setListOnly] = useState<boolean>(false);
+  const [extractionProgress, setExtractionProgress] = useState<Array<Record<string, unknown>>>([]);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const progressIntervalRef = useRef<number | null>(null);
 
   const imgSrc = useMemo(() => {
     if (!annotated) return null;
@@ -216,6 +218,34 @@ function App() {
     setExtractionLoading(true);
     setStatus("running extraction...");
     setExtractionResult(null);
+    setExtractionProgress([]);
+
+    // 启动进度轮询
+    progressIntervalRef.current = window.setInterval(async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/extraction_progress`);
+        const data = await resp.json();
+        if (data.progress && data.progress.length > 0) {
+          setExtractionProgress(data.progress);
+
+          // 更新状态显示
+          const lastProgress = data.progress[data.progress.length - 1];
+          const stage = lastProgress.stage || "unknown";
+          const currentAction = lastProgress.current_action || "";
+          const processed = lastProgress.processed || 0;
+          const total = lastProgress.total || 0;
+
+          if (currentAction) {
+            setStatus(`${stage}: ${currentAction} (${processed}/${total})`);
+          } else {
+            setStatus(`${stage} (${processed}/${total})`);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch progress:", err);
+      }
+    }, 500); // 每500ms轮询一次
+
     try {
       const resp = await fetch(`${API_BASE}/run_extraction`, {
         method: "POST",
@@ -235,6 +265,11 @@ function App() {
     } catch (err) {
       setStatus(`error: ${String(err)}`);
     } finally {
+      // 停止进度轮询
+      if (progressIntervalRef.current !== null) {
+        clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
       setExtractionLoading(false);
     }
   };
@@ -267,6 +302,15 @@ function App() {
     const closest = findClosestElement([x, y], elements);
     setHoverId(closest?.id ?? null);
   };
+
+  // 清理函数：组件卸载时停止轮询
+  useEffect(() => {
+    return () => {
+      if (progressIntervalRef.current !== null) {
+        clearInterval(progressIntervalRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div style={{ fontFamily: "sans-serif", padding: 16, display: "grid", gap: 12 }}>
@@ -414,6 +458,32 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* 实时进度显示 */}
+      {extractionLoading && extractionProgress.length > 0 && (
+        <div style={{ display: "grid", gap: 8, maxWidth: 1200, border: "1px solid #1e90ff", borderRadius: 6, padding: 12, background: "#e3f2fd" }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>实时进度</div>
+          <div style={{ display: "grid", gap: 4 }}>
+            {extractionProgress.map((prog, idx) => (
+              <div key={idx} style={{ padding: "6px 8px", background: "#fff", border: "1px solid #90caf9", borderRadius: 4, fontSize: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                  {String(prog.stage)} - {String(prog.status)}
+                </div>
+                {prog.current_action && (
+                  <div style={{ color: "#1565c0", fontSize: 11 }}>
+                    {String(prog.current_action)}
+                  </div>
+                )}
+                {prog.processed !== undefined && prog.total !== undefined && (
+                  <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
+                    进度: {String(prog.processed)} / {String(prog.total)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {extractionResult && (
         <div style={{ display: "grid", gap: 8, maxWidth: 1200, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fafafa" }}>

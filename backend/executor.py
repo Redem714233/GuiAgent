@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import logging
 from typing import Optional, Tuple
 
 from playwright.async_api import async_playwright
+
+logger = logging.getLogger(__name__)
 
 
 class Executor:
@@ -93,16 +96,54 @@ class Executor:
 
     async def goto(self, url: str) -> None:
         await self._ensure_page()
-        await self._page.goto(url)
-
-    async def screenshot(self, path: str) -> None:
         try:
-            await self._ensure_page()
-            await self._page.screenshot(path=path, full_page=False)
-        except Exception:
-            await self._restart()
-            await self._ensure_page()
-            await self._page.screenshot(path=path, full_page=False)
+            # 设置30秒超时，并且只等待 domcontentloaded 状态
+            await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        except Exception as e:
+            logger.warning(f"Page goto timeout or error: {e}, continuing anyway")
+            # 即使超时也继续执行
+
+    async def screenshot(self, path: str, max_retries: int = 2) -> None:
+        """
+        截图方法，带重试和超时保护
+        参考 Open-AutoGLM 的实现，使用更可靠的超时机制
+        """
+        for attempt in range(max_retries):
+            try:
+                await self._ensure_page()
+
+                # 使用 Playwright 的超时参数（30秒）
+                # 如果失败，会抛出 TimeoutError
+                await self._page.screenshot(path=path, full_page=False, timeout=30000)
+                logger.info(f"Screenshot saved successfully to {path}")
+                return  # 成功，直接返回
+
+            except Exception as e:
+                logger.warning(f"Screenshot attempt {attempt + 1}/{max_retries} failed: {e}")
+
+                if attempt < max_retries - 1:
+                    # 还有重试机会，重启浏览器
+                    logger.info("Restarting browser for retry...")
+                    await self._restart()
+                    await self._ensure_page()
+                    await asyncio.sleep(2)  # 等待2秒让浏览器稳定
+                else:
+                    # 最后一次尝试也失败了，创建一个黑色占位图
+                    logger.error(f"All screenshot attempts failed, creating fallback image")
+                    self._create_fallback_screenshot(path)
+                    return
+
+    def _create_fallback_screenshot(self, path: str) -> None:
+        """创建黑色占位图（参考 Open-AutoGLM）"""
+        try:
+            from PIL import Image
+            # 创建一个黑色图像
+            img = Image.new('RGB', (1280, 720), color='black')
+            img.save(path)
+            logger.info(f"Created fallback screenshot at {path}")
+        except Exception as e:
+            logger.error(f"Failed to create fallback screenshot: {e}")
+            raise
 
     async def click_center(self, center: Tuple[int, int]) -> None:
         try:
@@ -193,10 +234,19 @@ class Executor:
 
     async def wait_for_load(self, timeout_ms: int = 15000) -> None:
         await self._ensure_page()
+        # 优先等待 domcontentloaded，这��更可靠
         try:
-            await self._page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            await self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         except Exception:
-            await self._page.wait_for_load_state("load", timeout=timeout_ms)
+            pass  # 如果超时，继续执行
+
+        # 尝试等待 load 状态
+        try:
+            await self._page.wait_for_load_state("load", timeout=min(timeout_ms, 5000))
+        except Exception:
+            pass  # 如果超时，继续执行
+
+        # 短暂等待页面稳定
         try:
             await self._page.wait_for_timeout(500)
         except Exception:
@@ -219,6 +269,15 @@ class Executor:
             await self._restart()
             await self._ensure_page()
             await self._page.evaluate("y => window.scrollTo(0, y)", y)
+
+    async def go_back(self) -> None:
+        await self._ensure_page()
+        try:
+            await self._page.go_back()
+        except Exception:
+            await self._restart()
+            await self._ensure_page()
+            await self._page.go_back()
 
     async def extract_text_by_selector(self, selector: str) -> str:
         await self._ensure_page()

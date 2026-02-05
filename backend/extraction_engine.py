@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import logging
 from typing import Any, Dict, List, Optional
 
 from backend.executor import Executor
@@ -10,6 +11,8 @@ from backend.planner import Planner
 from backend.output_store import OutputStore
 from backend.schemas import ParseRequest, StepRequest
 from backend.storage import ensure_dir, timestamp_name
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionEngine:
@@ -38,6 +41,10 @@ class ExtractionEngine:
         self.output_store = output_store
         self.data_dir = data_dir
         ensure_dir(self.data_dir)
+
+        # 存储当前提取进度，供外部查询
+        self.current_progress: List[Dict[str, Any]] = []
+        self.is_extracting: bool = False
 
     async def run_extraction(
         self,
@@ -75,6 +82,10 @@ class ExtractionEngine:
         errors: List[str] = []
         extracted_items: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()  # 去重
+
+        # 初始化实例进度状态
+        self.current_progress = progress
+        self.is_extracting = True
 
         try:
             # 阶段1: 解析任务规格
@@ -138,22 +149,35 @@ class ExtractionEngine:
                 items = list_data.get("items", [])
                 next_action = list_data.get("next", "stop")
 
+                # 调试：记录VLM返回的数据类型
+                if items and not isinstance(items[0], dict):
+                    errors.append(f"VLM returned invalid items format. Expected list of dicts, got list of {type(items[0]).__name__}. First item: {items[0]}")
+                    errors.append(f"Full list_data: {list_data}")
+                    items = []  # 清空以避免后续错误
+
                 # 过滤已见过的URL（去重）
                 new_items = []
                 for item in items:
-                    item_url = item.get("url", "")
+                    # 验证item类型
+                    if not isinstance(item, dict):
+                        errors.append(f"Skipping non-dict item (type: {type(item).__name__}): {item}")
+                        continue
 
-                    # GitHub特殊处理：如果没有URL但title是owner/repo格式，自动生成URL
-                    if not item_url and "github.com" in current_url.lower():
-                        title = item.get("title", "")
-                        # 匹配 "owner/repo" 格式
-                        if "/" in title and not title.startswith("http"):
-                            # 移除多余空格
-                            repo_path = title.strip()
-                            # 如果是纯 owner/repo 格式
-                            if repo_path.count("/") == 1 and " " not in repo_path:
-                                item_url = f"https://github.com/{repo_path}"
-                                item["url"] = item_url
+                    # 如果有click_point，验证并保存（用于后续点击）
+                    if "click_point" in item and item["click_point"]:
+                        click_point = item["click_point"]
+                        # 验证click_point格式
+                        if isinstance(click_point, (list, tuple)) and len(click_point) == 2:
+                            try:
+                                x, y = int(click_point[0]), int(click_point[1])
+                                # 保存为元组
+                                item["_saved_click_point"] = (x, y)
+                            except (ValueError, TypeError) as e:
+                                errors.append(f"Warning: Invalid click_point format: {click_point}, error: {e}")
+                        else:
+                            errors.append(f"Warning: click_point must be [x, y], got: {click_point}")
+
+                    item_url = item.get("url", "")
 
                     # 标准化URL用于去重
                     normalized_url = item_url
@@ -173,7 +197,7 @@ class ExtractionEngine:
                             item["url"] = urljoin(current_url, item_url)
                         new_items.append(item)
                     elif not item_url:
-                        # 没有URL的项目（如评论），直接添加
+                        # 没有URL的项目（可能有element_id用于点击，或者是评论等），直接添加
                         new_items.append(item)
 
                 if new_items:
@@ -214,24 +238,50 @@ class ExtractionEngine:
                 progress.append({"stage": "extract_details", "status": "running", "processed": 0})
 
                 for idx, item in enumerate(extracted_items):
-                    if "url" not in item or not item["url"]:
+                    # 验证item类型
+                    if not isinstance(item, dict):
+                        errors.append(f"Item {idx} is not a dict (type: {type(item).__name__}): {item}")
+                        continue
+
+                    # 检查是否有URL或click_point
+                    has_url = "url" in item and item["url"]
+                    has_click_point = "_saved_click_point" in item and item["_saved_click_point"]
+
+                    if not has_url and not has_click_point:
+                        # 既没有URL也没有click_point，跳过
                         continue
 
                     try:
                         # 为每个详情页提取设置30秒总超时
                         async def extract_detail():
-                            # 导航到详情页
-                            detail_url = item["url"]
-                            if not detail_url.startswith("http"):
-                                # 相对URL，补全
-                                from urllib.parse import urljoin
-                                detail_url = urljoin(current_url, detail_url)
+                            # 导航到详情页：优先使用URL，否则使用点击
+                            if has_url:
+                                detail_url = item["url"]
+                                if not detail_url.startswith("http"):
+                                    # 相对URL，补全
+                                    from urllib.parse import urljoin
+                                    detail_url = urljoin(current_url, detail_url)
+                                progress[-1]["current_action"] = f"Navigating to {detail_url}"
+                                await self.executor.goto(detail_url)
+                                # 固定延迟
+                                await asyncio.sleep(2)
+                            elif has_click_point:
+                                # 使用VLM给出的坐标点击
+                                click_point = item["_saved_click_point"]
+                                x, y = click_point
+                                progress[-1]["current_action"] = f"Clicking at ({x}, {y})"
+                                await self.executor.click_center((x, y))
 
-                            await self.executor.goto(detail_url)
-                            await self.executor.wait_for_load(timeout_ms=10000)  # 10秒超时
-                            await self.executor.wait_for_stable(1000)  # 减少到1秒
+                            # 参考 AutoGLM：固定延迟而不是等待页面加载
+                            progress[-1]["current_action"] = "Waiting after navigation"
+                            logger.info(f"Waiting 2 seconds after navigation (item {idx})")
+                            await asyncio.sleep(2)  # 固定2秒延迟
+                            logger.info(f"Wait completed (item {idx})")
 
                             # 截图并提取详情
+                            progress[-1]["current_action"] = "Taking screenshot"
+                            logger.info(f"Starting screenshot (item {idx})")
+
                             if use_omniparser:
                                 screenshot_path, parse_resp = await self._capture_and_parse()
                                 detail_image_base64 = parse_resp.annotated_image_base64
@@ -242,8 +292,11 @@ class ExtractionEngine:
                                 with open(screenshot_path, "rb") as f:
                                     detail_image_base64 = base64.b64encode(f.read()).decode("ascii")
 
+                            logger.info(f"Screenshot completed (item {idx})")
+
                             detail_url_actual = await self.executor.get_url()
 
+                            progress[-1]["current_action"] = "Extracting detail data with VLM"
                             detail_data, detail_debug = self.planner.extract_from_page(
                                 task=task,
                                 mode="detail",
@@ -259,18 +312,28 @@ class ExtractionEngine:
 
                             # 返回列表页（如果需要继续提取）
                             if idx < len(extracted_items) - 1:
-                                await self.executor.goto(current_url)
-                                await self.executor.wait_for_load(timeout_ms=10000)
-                                await self.executor.wait_for_stable(1000)
+                                if has_url:
+                                    # 使用URL导航，直接返回列表页
+                                    progress[-1]["current_action"] = "Returning to list page"
+                                    await self.executor.goto(current_url)
+                                else:
+                                    # 使用点击进入，需要后退
+                                    progress[-1]["current_action"] = "Going back to list page"
+                                    await self.executor.go_back()
+                                # 固定延迟
+                                progress[-1]["current_action"] = "Waiting after return"
+                                await asyncio.sleep(2)
 
                         # 使用asyncio.wait_for添加30秒总超时
                         await asyncio.wait_for(extract_detail(), timeout=30.0)
 
                     except asyncio.TimeoutError:
-                        errors.append(f"Detail extraction timeout for item {idx} (url: {item.get('url', 'N/A')})")
+                        progress[-1]["current_action"] = f"Timeout at item {idx}"
+                        errors.append(f"Detail extraction timeout for item {idx} (url: {item.get('url', 'N/A')}, click_point: {item.get('_saved_click_point', 'N/A')})")
                         continue
                     except Exception as exc:
-                        errors.append(f"Detail extraction failed for item {idx} (url: {item.get('url', 'N/A')}): {type(exc).__name__}: {exc}")
+                        progress[-1]["current_action"] = f"Error at item {idx}: {type(exc).__name__}"
+                        errors.append(f"Detail extraction failed for item {idx} (url: {item.get('url', 'N/A')}, click_point: {item.get('_saved_click_point', 'N/A')}): {type(exc).__name__}: {exc}")
                         continue
 
                 progress[-1]["status"] = "completed"
@@ -321,19 +384,29 @@ class ExtractionEngine:
                 "errors": errors,
                 "items": extracted_items,
             }
+        finally:
+            # 清理提取状态
+            self.is_extracting = False
 
     async def _capture_and_parse(self):
-        """截图并解析元素"""
+        """截图并解析元素（简化版，移除额外的超时包装）"""
         screenshot_path = os.path.join(self.data_dir, timestamp_name("screenshot"))
-        await self.executor.screenshot(screenshot_path)
 
+        # screenshot 方法本身已经有超时保护和重试机制
+        logger.info(f"Starting screenshot to {screenshot_path}")
+        await self.executor.screenshot(screenshot_path)
+        logger.info(f"Screenshot completed")
+
+        logger.info("Reading screenshot file")
         import base64
         with open(screenshot_path, "rb") as f:
             image_b64 = base64.b64encode(f.read()).decode("ascii")
 
+        logger.info("Parsing screenshot with OmniParser")
         parse_resp = self.parser_service.parse(
             ParseRequest(image_base64=image_b64, use_paddleocr=True)
         )
+        logger.info("Screenshot parsed successfully")
 
         return screenshot_path, parse_resp
 

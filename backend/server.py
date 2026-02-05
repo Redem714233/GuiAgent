@@ -624,3 +624,20 @@ async def run_extraction(request: RunExtractionRequest) -> RunExtractionResponse
     )
     return RunExtractionResponse(**result)
 
+
+@app.get("/extraction_progress")
+def get_extraction_progress() -> dict:
+    """
+    获取当前提取进度
+
+    返回:
+    {
+        "is_extracting": bool,
+        "progress": list[dict]
+    }
+    """
+    return {
+        "is_extracting": extraction_engine.is_extracting,
+        "progress": extraction_engine.current_progress,
+    }
+
