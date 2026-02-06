@@ -45,11 +45,26 @@ class Executor:
     async def _start_fresh(self) -> None:
         self._playwright = await async_playwright().start()
         launch_kwargs = {"headless": False}
-        if self._channel:
+
+        # 根据 channel 选择浏览器类型
+        if self._channel in ["msedge", "chrome"]:
+            browser_type = self._playwright.chromium
             launch_kwargs["channel"] = self._channel
-        if self._executable:
-            launch_kwargs["executable_path"] = self._executable
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+            # 注意：使用 channel 时不要设置 executable_path
+        elif self._channel == "firefox":
+            browser_type = self._playwright.firefox
+            if self._channel:
+                launch_kwargs["channel"] = self._channel
+        elif self._channel == "webkit":
+            browser_type = self._playwright.webkit
+        else:
+            # 没有指定 channel，使用默认 chromium
+            browser_type = self._playwright.chromium
+            # 只有在没有 channel 时才使用 executable_path
+            if self._executable:
+                launch_kwargs["executable_path"] = self._executable
+
+        self._browser = await browser_type.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             viewport={"width": self._viewport_width, "height": self._viewport_height},
             device_scale_factor=self._device_scale_factor,

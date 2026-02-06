@@ -88,6 +88,8 @@ class StepResponse(BaseModel):
     planner_debug: Optional[dict] = None
     finish_debug: Optional[dict] = None
     extracted: Optional[dict] = None
+    # v2.2: VLM 对话详情（用于 debug）
+    vlm_conversation: Optional[dict] = None
 
 
 class TaskSpec(BaseModel):

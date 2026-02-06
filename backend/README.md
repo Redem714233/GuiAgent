@@ -2,7 +2,25 @@
 
 基于 Skyvern 架构模式的浏览器自动化系统
 
-## 🎉 v2.1 最新更新 (2026-02-05)
+## 🎉 v2.2 最新更新 (2026-02-06)
+
+**DOM 驱动的视觉标注系统（完全替代 OmniParser）**
+
+核心改进：废弃 YOLO/Florence2 视觉检测，全面转向 DOM 驱动的视觉增强架构。
+
+**关键特性：**
+- ✅ **DOM 视觉标注**：使用 Pillow 在截图上绘制 DOM 坐标的红框 + ID 标签
+- ✅ **统一数据源**：视觉标注和 href 提取都来自 DOM，数据一致性更好
+- ✅ **更轻量**：无需深度学习模型（YOLO/Florence2），启动更快
+- ✅ **更准确**：DOM 坐标精确，避免 YOLO 检测框不准确的问题
+- ✅ **可配置**：通过 `USE_DOM_ANNOTATION=1` 启用新方案
+
+**新增文件：**
+- `backend/visualizer.py` - DOM 视觉标注模块
+
+---
+
+## 🎉 v2.1 更新 (2026-02-05)
 
 **DOM-based 元素定位系统（参考Skyvern架构）**
 
@@ -30,13 +48,14 @@ backend/
 │   ├── actions.py        # 动作类层次结构
 │   ├── handler.py        # 动作执行器
 │   └── parser.py         # 动作解析器
-├── dom_marker.js         # DOM元素标记（JavaScript）⭐ v2.1新增
-├── dom_service.py        # DOM服务封装 ⭐ v2.1新增
+├── dom_marker.js         # DOM元素标记（JavaScript）⭐ v2.1
+├── dom_service.py        # DOM服务封装 ⭐ v2.1
+├── visualizer.py         # DOM视觉标注模块 ⭐ v2.2新增
 ├── extraction_engine.py  # 数据提取引擎
 ├── executor.py           # 浏览器控制器（Playwright）
 ├── planner.py            # 决策规划器（LLM/VLM）
 ├── vlm_service.py        # 视觉语言模型服务
-├── omniparser_service.py # UI 元素检测服务
+├── omniparser_service.py # UI 元素检测服务（已废弃）
 ├── web_agent.py          # 高级代理编排
 ├── server.py             # FastAPI REST API
 └── schemas.py            # Pydantic 数据模型

@@ -26,6 +26,22 @@ type StepResponse = {
   current_url?: string | null;
   planner_debug?: Record<string, unknown> | null;
   finish_debug?: Record<string, unknown> | null;
+  // v2.2: VLM 对话详情
+  vlm_conversation?: {
+    request: {
+      task: string;
+      elements_count: number;
+      elements: Array<{
+        id: number;
+        type: string;
+        content: string;
+      }>;
+      image_size: [number, number];
+      annotated_image: string;
+    };
+    response: Record<string, unknown>;
+    response_raw: string;
+  } | null;
 };
 
 type PlanStepsResponse = {
@@ -76,6 +92,7 @@ function App() {
   const [useOmniparser, setUseOmniparser] = useState<boolean>(true);
   const [listOnly, setListOnly] = useState<boolean>(false);
   const [extractionProgress, setExtractionProgress] = useState<Array<Record<string, unknown>>>([]);
+  const [vlmConversation, setVlmConversation] = useState<StepResponse['vlm_conversation']>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const progressIntervalRef = useRef<number | null>(null);
 
@@ -146,6 +163,7 @@ function App() {
         action_scroll: data.action_scroll || null,
       });
       setFinishDebug(data.finish_debug || null);
+      setVlmConversation(data.vlm_conversation || null);
       setStatus(`done (${data.reason || data.action || ""})`);
     } catch (err) {
       setStatus(`error: ${String(err)}`);
@@ -443,6 +461,96 @@ function App() {
           </div>
         </div>
       </div>
+
+      {/* VLM 对话详情 (v2.2) */}
+      {vlmConversation && (
+        <div style={{ display: "grid", gap: 12, maxWidth: 1200, border: "2px solid #1e90ff", borderRadius: 8, padding: 16, background: "#f0f8ff" }}>
+          <div style={{ fontWeight: 600, fontSize: 18, color: "#1e90ff" }}>🔍 VLM 对话详情 (Debug)</div>
+
+          {/* 标注图片 - VLM 看到的 */}
+          <div style={{ display: "grid", gap: 8 }}>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>标注图片（VLM 看到的）</div>
+            <div style={{ border: "1px solid #ddd", borderRadius: 6, overflow: "hidden", background: "#fff" }}>
+              <img
+                src={`data:image/png;base64,${vlmConversation.request.annotated_image}`}
+                alt="VLM Annotated View"
+                style={{ width: "100%", maxWidth: 800, display: "block" }}
+              />
+            </div>
+          </div>
+
+          {/* 请求信息 */}
+          <div style={{ display: "grid", gap: 8, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fff" }}>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>📤 VLM 请求信息</div>
+            <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
+              <div><strong>任务:</strong> {vlmConversation.request.task}</div>
+              <div><strong>元素数量:</strong> {vlmConversation.request.elements_count}</div>
+              <div><strong>图片尺寸:</strong> {vlmConversation.request.image_size[0]} × {vlmConversation.request.image_size[1]}</div>
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>元素列表（前20个）:</div>
+              <div style={{ maxHeight: 200, overflowY: "auto", border: "1px solid #eee", borderRadius: 4 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead style={{ position: "sticky", top: 0, background: "#f5f5f5", borderBottom: "1px solid #ddd" }}>
+                    <tr>
+                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>ID</th>
+                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>类型</th>
+                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>内容</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vlmConversation.request.elements.map((elem) => (
+                      <tr key={elem.id} style={{ borderBottom: "1px solid #eee" }}>
+                        <td style={{ padding: "6px 8px" }}>{elem.id}</td>
+                        <td style={{ padding: "6px 8px", color: "#666" }}>{elem.type}</td>
+                        <td style={{ padding: "6px 8px", maxWidth: 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {elem.content}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {/* 响应信息 */}
+          <div style={{ display: "grid", gap: 8, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fff" }}>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>📥 VLM 响应</div>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>解析后的 JSON:</div>
+              <pre style={{
+                margin: 0,
+                padding: 10,
+                background: "#f5f5f5",
+                borderRadius: 4,
+                fontSize: 12,
+                overflowX: "auto",
+                border: "1px solid #ddd"
+              }}>
+                {JSON.stringify(vlmConversation.response, null, 2)}
+              </pre>
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>原始响应文本:</div>
+              <pre style={{
+                margin: 0,
+                padding: 10,
+                background: "#f5f5f5",
+                borderRadius: 4,
+                fontSize: 12,
+                overflowX: "auto",
+                border: "1px solid #ddd",
+                whiteSpace: "pre-wrap"
+              }}>
+                {vlmConversation.response_raw}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "grid", gap: 6, maxWidth: 1200 }}>
         <div style={{ fontWeight: 600 }}>Outputs</div>

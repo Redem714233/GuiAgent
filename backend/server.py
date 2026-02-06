@@ -21,6 +21,9 @@ from .schemas import SaveOutputResponse, FileListResponse, RunExtractionRequest,
 from .output_store import OutputStore
 from .storage import ensure_dir, timestamp_name
 from .extraction_engine import ExtractionEngine
+from .visualizer import annotate_screenshot_base64
+from PIL import Image
+import io
 
 load_dotenv()
 
@@ -72,11 +75,127 @@ def plan(request: PlanRequest) -> PlanResponse:
 
 
 async def _capture_and_parse() -> tuple[str, ParseResponse]:
+    """
+    截图并解析元素
+
+    根据环境变量 USE_DOM_ANNOTATION 决定使用：
+    - DOM 标注（新方案）：使用 DOM 坐标在截图上绘制标注框
+    - OmniParser 标注（旧方案）：使用 YOLO + Florence2 检测元素
+    """
+    use_dom_annotation = os.getenv("USE_DOM_ANNOTATION", "1").strip().lower() in {"1", "true", "yes", "on"}
+
     screenshot_path = os.path.join(DATA_DIR, timestamp_name("screenshot"))
     await executor.screenshot(screenshot_path)
+
     with open(screenshot_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("ascii")
-    parse_resp = get_parser_service().parse(ParseRequest(image_base64=image_b64, use_paddleocr=True))
+
+    if use_dom_annotation:
+        # 新方案：DOM 驱动的视觉标注
+        return await _capture_and_annotate_dom(screenshot_path, image_b64)
+    else:
+        # 旧方案：OmniParser 标注
+        parse_resp = get_parser_service().parse(ParseRequest(image_base64=image_b64, use_paddleocr=True))
+        return screenshot_path, parse_resp
+
+
+async def _capture_and_annotate_dom(screenshot_path: str, image_b64: str) -> tuple[str, ParseResponse]:
+    """
+    使用 DOM 标注方案
+
+    流程：
+    1. 调用 DOM 标记（mark_page_elements）
+    2. 使用 visualizer 在截图上绘制标注框
+    3. 构造 ParseResponse
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # 1. 获取 DOM 元素
+    dom_result = await executor.mark_page_elements()
+    dom_elements = dom_result.get('elements', [])
+    viewport = dom_result.get('viewport', {})
+
+    logger.info(f"DOM marking found {len(dom_elements)} elements")
+
+    # 2. 使用 visualizer 标注截图
+    try:
+        annotated_image_b64 = annotate_screenshot_base64(
+            image_base64=image_b64,
+            elements=dom_elements,
+            max_elements=None,  # 标注所有元素
+        )
+
+        # 保存标注图片到磁盘（用于 debug）
+        annotated_path = screenshot_path.replace('.png', '_annotated.png')
+        annotated_data = base64.b64decode(annotated_image_b64)
+        with open(annotated_path, 'wb') as f:
+            f.write(annotated_data)
+        logger.info(f"Saved annotated image to {annotated_path}")
+
+    except Exception as e:
+        logger.error(f"Failed to annotate screenshot: {e}")
+        # 如果标注失败，使用原始截图
+        annotated_image_b64 = image_b64
+
+    # 3. 转换 DOM 元素为 Element 对象
+    elements = []
+    for idx, elem in enumerate(dom_elements):
+        # 提取元素 ID（去掉 "skyvern-" 前缀，只保留数字）
+        elem_id_str = elem.get('id', '')
+        if isinstance(elem_id_str, str) and '-' in elem_id_str:
+            elem_id = int(elem_id_str.split('-')[-1])
+        else:
+            elem_id = idx
+
+        # 提取坐标
+        rect = elem.get('rect', {})
+        x = rect.get('x', rect.get('left', 0))
+        y = rect.get('y', rect.get('top', 0))
+        width = rect.get('width', 0)
+        height = rect.get('height', 0)
+
+        # 计算中心点
+        center_x = x + width // 2
+        center_y = y + height // 2
+
+        # 提取文本内容
+        text = elem.get('text', '').strip()
+
+        # 提取标签类型
+        tag_name = elem.get('tagName', 'unknown')
+
+        # 确定元素类型
+        if tag_name == 'input':
+            elem_type = 'dom_input'
+        elif tag_name == 'a':
+            elem_type = 'dom_link'
+        elif tag_name == 'button':
+            elem_type = 'dom_button'
+        else:
+            elem_type = f'dom_{tag_name}'
+
+        # 构造 Element 对象
+        element = Element(
+            id=elem_id,
+            type=elem_type,
+            content=text[:200] if text else f"{tag_name}",  # 限制文本长度
+            center=(center_x, center_y),
+            bbox=(x, y, width, height),
+        )
+        elements.append(element)
+
+    # 4. 构造 ParseResponse
+    image_size = (viewport.get('width', 1920), viewport.get('height', 1080))
+
+    parse_resp = ParseResponse(
+        elements=elements,
+        annotated_image_base64=annotated_image_b64,
+        image_size=image_size,
+    )
+
+    logger.info(f"DOM annotation complete: {len(elements)} elements, image_size={image_size}")
+
     return screenshot_path, parse_resp
 
 
@@ -192,6 +311,8 @@ async def step(request: StepRequest) -> StepResponse:
     action_scroll = None
     reason = "override"
     llm_query = None
+    vlm_conversation = None  # v2.2: VLM 对话详情
+
     if target_id is None and request.override_point is None:
         plan_resp = planner.plan(
             PlanRequest(
@@ -213,6 +334,27 @@ async def step(request: StepRequest) -> StepResponse:
         reason = plan_resp.reason
         llm_query = plan_resp.query
         planner_debug = plan_resp.debug
+
+        # v2.2: 构造 VLM 对话详情（用于前端 debug）
+        if planner_debug and planner_debug.get('provider') in {'qwen3-vl', 'dashscope'}:
+            vlm_conversation = {
+                'request': {
+                    'task': request.task,
+                    'elements_count': len(parse_resp.elements),
+                    'elements': [
+                        {
+                            'id': e.id,
+                            'type': e.type,
+                            'content': e.content[:50] + '...' if len(e.content) > 50 else e.content,
+                        }
+                        for e in parse_resp.elements[:20]  # 只显示前20个元素
+                    ],
+                    'image_size': parse_resp.image_size,
+                    'annotated_image': parse_resp.annotated_image_base64,  # 标注图片
+                },
+                'response': planner_debug.get('response', {}),
+                'response_raw': planner_debug.get('response_raw', ''),
+            }
     else:
         planner_debug = None
 
@@ -326,6 +468,7 @@ async def step(request: StepRequest) -> StepResponse:
             current_url=new_url,
             planner_debug=planner_debug,
             finish_debug=new_finish_debug,
+            vlm_conversation=vlm_conversation,  # v2.2: VLM 对话详情
         )
 
     # 4) Legacy click / search chain
@@ -381,6 +524,7 @@ async def step(request: StepRequest) -> StepResponse:
                 current_url=new_url,
                 planner_debug=planner_debug,
                 finish_debug=new_finish_debug,
+                vlm_conversation=vlm_conversation,  # v2.2: VLM 对话详情
             )
         old_url = await executor.get_url()
         await executor.click_center(elem.center)
@@ -412,6 +556,7 @@ async def step(request: StepRequest) -> StepResponse:
             current_url=new_url,
             planner_debug=planner_debug,
             finish_debug=new_finish_debug,
+            vlm_conversation=vlm_conversation,  # v2.2: VLM 对话详情
         )
     elif target_point is not None:
         old_url = await executor.get_url()
