@@ -1,5 +1,61 @@
 # GUIAgent - 智能浏览器自动化系统
 
+## 🎉 v3.1 最新更新 (2026-02-09)
+
+### 🚀 智能翻页功能（参考 Skyvern）
+
+实现了完整的翻页支持，可以自动识别和处理网页的分页内容。
+
+**核心特性**：
+- ✅ **三层翻页按钮识别**：VLM智能识别 → 关键词匹配 → VLM专项分析
+- ✅ **智能滚动翻页**：基于 Skyvern 的滚动检测算法
+  - 可滚动性检测
+  - 底部检测（25px 阈值）
+  - 重叠滚动（200px 重叠确保内容连续性）
+  - 滚动距离验证
+- ✅ **多语言支持**：中文（下一页、下页）、英文（Next、Next Page）、符号（›、»、→）
+- ✅ **降级策略**：按钮点击失败时自动回退到滚动模式
+
+**支���的分页类型**：
+- 传统分页按钮：`<a href="?page=2">下一页</a>`
+- 数字分页：`1 2 3 [4] 5 ›`
+- 箭头分页：`→ » ›`
+- 加载更多：`Load More` / `显示更多`
+- 无限滚动：自动检测新内容加载
+
+📖 **详细文档**: [docs/PAGINATION_FEATURE.md](docs/PAGINATION_FEATURE.md)
+
+### 🛡️ 反爬虫解决方案
+
+针对豆瓣等网站的反爬虫机制，实现了完整的应对措施。
+
+**核心特性**：
+- ✅ **真实浏览器特征模拟**：User-Agent、Headers、时区、语言
+- ✅ **隐藏自动化特征**：覆盖 `navigator.webdriver`
+- ✅ **Cookie 管理**：保存和加载登录状态
+- ✅ **手动登录支持**：等待用户完成登录并自动保存 Cookie
+
+**新增方法**：
+- `save_cookies(file_path)` - 保存 Cookie 到文件
+- `load_cookies(file_path)` - 从文件加载 Cookie
+- `wait_for_manual_login(timeout)` - 等待用户手动登录
+
+📖 **详细文档**: [docs/ANTI_CRAWLER.md](docs/ANTI_CRAWLER.md)
+
+**使用示例**：
+```bash
+# 豆瓣登录示例（自动处理 Cookie）
+python examples/douban_with_login.py
+```
+
+**代码改进**：
+- [backend/executor.py](backend/executor.py:67-115) - 反爬虫措施和 Cookie 管理
+- [backend/executor.py](backend/executor.py:773-843) - Cookie 管理方法
+- [backend/extraction_engine.py](backend/extraction_engine.py:249-281) - 智能翻页逻辑
+- [backend/vlm_service.py](backend/vlm_service.py:505-575) - 翻页按钮识别
+
+---
+
 ## 🎉 v3.0 最新更新 (2026-02-06)
 
 **基于 Skyvern 的高级 DOM 标注系统**

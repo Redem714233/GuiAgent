@@ -134,6 +134,7 @@ class RunExtractionRequest(BaseModel):
     max_items: int = Field(10, ge=1, le=100)
     strategy: Optional[dict] = None
     use_omniparser: bool = Field(False, description="是否使用OmniParser标注图片（False则使用原始截图）")
+    use_reflection: bool = Field(True, description="是否使用反思机制进行翻页验证和重试（默认启用）")
 
 
 class RunExtractionResponse(BaseModel):

@@ -11,6 +11,7 @@ from backend.planner import Planner
 from backend.output_store import OutputStore
 from backend.schemas import ParseRequest, StepRequest
 from backend.storage import ensure_dir, timestamp_name
+from backend.scrolling_screenshot import take_scrolling_screenshot
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class ExtractionEngine:
         max_items: int = 10,
         strategy: Optional[Dict[str, Any]] = None,
         use_omniparser: bool = False,
+        use_reflection: bool = True,  # 新增：默认启用反思机制
     ) -> Dict[str, Any]:
         """
         运行完整的数据提取流程
@@ -119,29 +121,103 @@ class ExtractionEngine:
             progress[-1]["status"] = "completed"
             progress[-1]["url"] = current_url
 
+            # 检测任务是否要求先翻页再提取
+            import re
+            pagination_match = re.search(r'翻到第(\d+)页|翻页到第(\d+)页|go to page (\d+)|page (\d+)', task, re.IGNORECASE)
+            target_page = None
+            pre_paginated = False  # 标记是否已经预翻页
+            if pagination_match:
+                # 提取目标页码
+                target_page = int([g for g in pagination_match.groups() if g][0])
+                logger.info(f"Detected pagination request: go to page {target_page}")
+
+            # 如果需要先翻页，执行预翻页
+            if target_page and target_page > 1:
+                progress.append({"stage": "pre_pagination", "status": "running", "target_page": target_page})
+                logger.info(f"Pre-pagination: navigating to page {target_page} before extraction")
+
+                # 翻页 (target_page - 1) 次
+                for page_num in range(2, target_page + 1):
+                    logger.info(f"Pre-pagination: clicking to page {page_num}")
+
+                    # 标记元素
+                    dom_result = await self.executor.mark_page_elements()
+                    dom_elements = dom_result.get('elements', [])
+
+                    # 截图
+                    import base64
+                    screenshot_path = f"data/pre_pagination_page_{page_num - 1}.png"
+                    await self.executor.screenshot(screenshot_path)
+                    with open(screenshot_path, "rb") as f:
+                        image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+                    current_url = await self.executor.get_url()
+
+                    # 简化方法：直接从 DOM 元素中查找 next 按钮
+                    next_page_element_id = None
+                    for elem in dom_elements:
+                        text = elem.get('text', '').lower()
+                        if 'next' in text or '下一页' in text or '›' in text:
+                            next_page_element_id = elem.get('id')
+                            logger.info(f"Found next button: {elem.get('id')} with text '{elem.get('text')}'")
+                            break
+
+                    if not next_page_element_id:
+                        logger.error(f"Pre-pagination failed: no next button found on page {page_num - 1}")
+                        errors.append(f"Pre-pagination failed: no next button found on page {page_num - 1}")
+                        break
+
+                    # 使用反思机制翻页
+                    if use_reflection:
+                        logger.info(f"Pre-pagination: using reflection to go to page {page_num}")
+                        pagination_result = await self._click_next_page_with_reflection(
+                            {"next_page_element_id": next_page_element_id},
+                            dom_elements,
+                            current_url,
+                            max_retries=3
+                        )
+                        if not pagination_result["success"]:
+                            logger.error(f"Pre-pagination failed: {pagination_result['reasoning']}")
+                            errors.append(f"Pre-pagination failed: {pagination_result['reasoning']}")
+                            break
+                    else:
+                        # 不使用反思机制
+                        success = await self.executor.click_element_by_id(next_page_element_id)
+                        if not success:
+                            logger.error(f"Pre-pagination failed: could not click element {next_page_element_id}")
+                            errors.append(f"Pre-pagination failed: could not click element {next_page_element_id}")
+                            break
+                        await asyncio.sleep(2)
+                        await self.executor.wait_for_stable(2000)
+
+                    logger.info(f"Pre-pagination: successfully navigated to page {page_num}")
+
+                progress[-1]["status"] = "completed"
+                current_url = await self.executor.get_url()
+                progress[-1]["final_url"] = current_url
+                logger.info(f"Pre-pagination completed. Now on page {target_page}, URL: {current_url}")
+                pre_paginated = True  # 标记已经预翻页
+
             # 阶段3: 循环提取列表数据
             progress.append({"stage": "extract_list", "status": "running", "items": 0})
             scroll_count = 0
             consecutive_empty = 0  # 连续空提取次数
 
             while len(extracted_items) < target_count and scroll_count < max_scrolls:
-                # 标记DOM元素
-                dom_elements_result = await self.executor.mark_page_elements()
-                dom_elements = dom_elements_result.get('elements', [])
-
-                # 截图并解析
-                if use_omniparser:
-                    screenshot_path, parse_resp = await self._capture_and_parse()
-                    image_base64 = parse_resp.annotated_image_base64
-                else:
-                    # 使用原始截图，不经过OmniParser
-                    screenshot_path = os.path.join(self.data_dir, timestamp_name("screenshot"))
-                    await self.executor.screenshot(screenshot_path)
-                    import base64
-                    with open(screenshot_path, "rb") as f:
-                        image_base64 = base64.b64encode(f.read()).decode("ascii")
-
+                # 标记当前视口的元素
                 current_url = await self.executor.get_url()
+                logger.info(f"Extracting from URL: {current_url}")
+                logger.info("Marking page elements")
+                dom_result = await self.executor.mark_page_elements()
+                dom_elements = dom_result.get('elements', [])
+                logger.info(f"Marked {len(dom_elements)} elements")
+
+                # 截图
+                screenshot_path = os.path.join(self.data_dir, timestamp_name("screenshot"))
+                await self.executor.screenshot(screenshot_path)
+                import base64
+                with open(screenshot_path, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode("ascii")
 
                 # 提取当前页面的列表项（传入DOM元素列表）
                 list_data, list_debug = self.planner.extract_from_page(
@@ -154,6 +230,14 @@ class ExtractionEngine:
 
                 items = list_data.get("items", [])
                 next_action = list_data.get("next", "stop")
+
+                # 调试日志：显示 VLM 的决策
+                logger.info(f"VLM extracted {len(items)} items from {current_url}, next_action={next_action}")
+                if items:
+                    logger.info(f"First item title: {items[0].get('title', 'N/A')}")
+                if next_action == "next_page":
+                    next_page_id = list_data.get("next_page_element_id")
+                    logger.info(f"VLM suggested next_page with element_id={next_page_id}")
 
                 # 调试：记录VLM返回的数据类型
                 if items and not isinstance(items[0], dict):
@@ -238,27 +322,69 @@ class ExtractionEngine:
                 else:
                     consecutive_empty += 1
 
-                # 检查是否需要继续
-                if len(extracted_items) >= target_count:
-                    break
-
+                # 检查连续空提取
                 if consecutive_empty >= 2:
                     # 连续2次空提取，可能已经到底
                     break
 
-                # 根据VLM建议决定下一步动作
+                # 根据VLM建议决定下一步动作（先翻页，再检查是否够了）
+                # 如果已经预翻页到目标页，不要再翻页
+                if pre_paginated and next_action == "next_page":
+                    logger.info("Already pre-paginated to target page, ignoring VLM's next_page suggestion")
+                    next_action = "stop"
+
                 if next_action == "scroll":
-                    await self.executor.scroll_by(600)
-                    await self.executor.wait_for_stable(1500)
-                    scroll_count += 1
+                    # 使用智能滚动翻页（参考 Skyvern）
+                    scroll_success = await self._smart_scroll_pagination()
+                    if scroll_success:
+                        await self.executor.wait_for_stable(1500)
+                        scroll_count += 1
+                    else:
+                        # 已到达页面底部
+                        logger.info("Reached page bottom, stopping scroll")
+                        break
                 elif next_action == "next_page":
-                    # TODO: 识别并点击"下一页"按钮
-                    # 暂时使用滚动代替
-                    await self.executor.scroll_by(600)
-                    await self.executor.wait_for_stable(1500)
-                    scroll_count += 1
+                    # 识别并点击"下一页"按钮
+                    if use_reflection:
+                        # 使用反思机制翻页（带验证和重试）
+                        logger.info("Using reflection mechanism for pagination")
+                        pagination_result = await self._click_next_page_with_reflection(
+                            list_data, dom_elements, current_url, max_retries=3
+                        )
+                        if pagination_result["success"]:
+                            scroll_count += 1
+                            logger.info(f"Successfully paginated with reflection: {pagination_result['reasoning']}")
+                        else:
+                            logger.error(f"Failed to paginate after {pagination_result['retry_count']} retries: {pagination_result['reasoning']}")
+                            # 翻页失败，停止提��
+                            break
+                    else:
+                        # 原有逻辑（不验证）
+                        next_page_clicked = await self._click_next_page_button(
+                            list_data, dom_elements, current_url
+                        )
+                        if next_page_clicked:
+                            # 等待新页面加载
+                            await self.executor.wait_for_stable(2000)
+                            scroll_count += 1
+                            logger.info("Successfully clicked next page button")
+                        else:
+                            # 如果无法点击下一页按钮，尝试智能滚动
+                            logger.warning("Failed to click next page button, falling back to smart scroll")
+                            scroll_success = await self._smart_scroll_pagination()
+                            if scroll_success:
+                                await self.executor.wait_for_stable(1500)
+                                scroll_count += 1
+                            else:
+                                # 已到达页面底部
+                                break
                 else:
                     # stop
+                    break
+
+                # 翻页后，检查是否已经提取够了
+                if len(extracted_items) >= target_count:
+                    logger.info(f"Reached target count ({target_count}), stopping extraction")
                     break
 
             progress[-1]["status"] = "completed"
@@ -580,4 +706,346 @@ class ExtractionEngine:
                 await self.executor.press(plan_resp.action_key)
             await self.executor.wait_for_load()
 
-        await self.executor.wait_for_stable(1000)
+    async def _click_next_page_with_reflection(
+        self,
+        list_data: Dict[str, Any],
+        dom_elements: List[Dict[str, Any]],
+        current_url: str,
+        max_retries: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        使用反思机制点击"下一页"按钮（带验证和重试）
+
+        Args:
+            list_data: VLM返回的列表数据，可能包含next_page_element_id
+            dom_elements: 当前页面的DOM元素列表
+            current_url: 当前页面URL
+            max_retries: 最大重试次数
+
+        Returns:
+            {
+                "success": bool,
+                "retry_count": int,
+                "reasoning": str,
+                "before_url": str,
+                "after_url": str
+            }
+        """
+        import base64
+
+        retry_count = 0
+
+        while retry_count < max_retries:
+            logger.info(f"Pagination attempt {retry_count + 1}/{max_retries}")
+
+            # 1. 捕获执行前状态
+            before_url = await self.executor.get_url()
+
+            # 截图（前）
+            before_screenshot_path = f"data/pagination_before_{retry_count}.png"
+            await self.executor.screenshot(before_screenshot_path)
+            with open(before_screenshot_path, "rb") as f:
+                before_image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+            # 获取元素列表（前）
+            dom_result_before = await self.executor.mark_page_elements()
+            elements_before = dom_result_before.get('elements', [])
+
+            # 2. 执行翻页动作
+            try:
+                click_success = await self._click_next_page_button(
+                    list_data, dom_elements, current_url
+                )
+                if not click_success:
+                    logger.warning(f"Failed to click next page button on attempt {retry_count + 1}")
+                    retry_count += 1
+                    continue
+            except Exception as e:
+                logger.error(f"Error clicking next page button: {e}")
+                retry_count += 1
+                continue
+
+            # 3. 等待页面稳定
+            await asyncio.sleep(2)
+            await self.executor.wait_for_stable(2000)
+
+            # 4. 捕获执行后状态
+            after_url = await self.executor.get_url()
+
+            # 截图（后）
+            after_screenshot_path = f"data/pagination_after_{retry_count}.png"
+            await self.executor.screenshot(after_screenshot_path)
+            with open(after_screenshot_path, "rb") as f:
+                after_image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+            # 获取元素列表（后）
+            dom_result_after = await self.executor.mark_page_elements()
+            elements_after = dom_result_after.get('elements', [])
+
+            # 5. 验证翻页是否成功
+            # 创建 VLMService 实例
+            if not hasattr(self, '_vlm_service'):
+                from backend.vlm_service import VLMService
+                self._vlm_service = VLMService()
+
+            verification, verification_raw = self._vlm_service.verify_step_success(
+                task="翻页到下一页",
+                step_description="click next page button",
+                action_taken="click pagination button",
+                before_url=before_url,
+                after_url=after_url,
+                before_image_base64=before_image_base64,
+                after_image_base64=after_image_base64,
+                elements_before=elements_before,
+                elements_after=elements_after,
+            )
+
+            logger.info(f"Pagination verification: {verification}")
+
+            # 6. 决策
+            if verification.get("success", False):
+                # 成功
+                return {
+                    "success": True,
+                    "retry_count": retry_count,
+                    "reasoning": verification.get("reasoning", "Pagination successful"),
+                    "before_url": before_url,
+                    "after_url": after_url,
+                    "verification": verification
+                }
+            elif verification.get("should_retry", True) and retry_count < max_retries - 1:
+                # 失败但可重试
+                logger.warning(f"Pagination failed but retrying: {verification.get('reasoning', '')}")
+                retry_count += 1
+                continue
+            else:
+                # 失败且不可重试
+                logger.error(f"Pagination failed permanently: {verification.get('reasoning', '')}")
+                return {
+                    "success": False,
+                    "retry_count": retry_count,
+                    "reasoning": verification.get("reasoning", "Pagination failed"),
+                    "before_url": before_url,
+                    "after_url": after_url,
+                    "verification": verification
+                }
+
+        # 达到最大重试次数
+        return {
+            "success": False,
+            "retry_count": retry_count,
+            "reasoning": f"Max retries ({max_retries}) reached",
+            "before_url": before_url,
+            "after_url": after_url,
+            "verification": {"reasoning": "Max retries reached"}
+        }
+
+    async def _click_next_page_button(
+        self,
+        list_data: Dict[str, Any],
+        dom_elements: List[Dict[str, Any]],
+        current_url: str,
+    ) -> bool:
+        """
+        识别并点击"下一页"按钮
+
+        Args:
+            list_data: VLM返回的列表数据，可能包含next_page_element_id
+            dom_elements: 当前页面的DOM元素列表
+            current_url: 当前页面URL
+
+        Returns:
+            是否成功点击下一页按钮
+        """
+        try:
+            # 方法1: 检查VLM是否返回了next_page_element_id
+            next_page_element_id = list_data.get("next_page_element_id")
+
+            if next_page_element_id:
+                logger.info(f"VLM provided next_page_element_id: {next_page_element_id}")
+                # 使用element_id点击
+                success = await self.executor.click_element_by_id(next_page_element_id)
+                if success:
+                    return True
+                logger.warning(f"Failed to click element {next_page_element_id}")
+
+            # 方法2: 滚动到底部，重新标记元素，然后在DOM中搜索翻页按钮
+            logger.info("Scrolling to bottom to find pagination button")
+            await self.executor.scroll_to_bottom()
+            await self.executor.wait_for_stable(1000)
+
+            # 重新标记底部视口的元素
+            dom_result = await self.executor.mark_page_elements()
+            bottom_elements = dom_result.get('elements', [])
+            logger.info(f"Marked {len(bottom_elements)} elements at bottom")
+
+            # 合并顶部和底部的元素
+            all_elements = dom_elements + bottom_elements
+
+            next_page_keywords = [
+                "下一页", "next page", "next", "›", "»", "→",
+                "下页", "nextpage", "page-next", "pagination-next",
+                "翻页", "more", "load more"
+            ]
+
+            # 收集所有可能的下一页按钮
+            potential_buttons = []
+            for elem in all_elements:
+                elem_text = (elem.get("text", "") or "").lower().strip()
+                elem_id = elem.get("id", "")
+                elem_class = (elem.get("attributes", {}).get("class", "") or "").lower()
+                elem_aria_label = (elem.get("attributes", {}).get("aria-label", "") or "").lower()
+                elem_href = (elem.get("attributes", {}).get("href", "") or "").lower()
+
+                # 检查文本、class、aria-label是否包含下一页关键词
+                for keyword in next_page_keywords:
+                    keyword_lower = keyword.lower()
+                    if (keyword_lower in elem_text or
+                        keyword_lower in elem_class or
+                        keyword_lower in elem_aria_label):
+
+                        # 计算优先级分数
+                        score = 0
+                        # 优先选择 href 包含 "page-" 的链接（真正的翻页）
+                        if "page-" in elem_href:
+                            score += 100
+                        # 优先选择 class 包含 "pag" 的元素（pagination）
+                        if "pag" in elem_class:
+                            score += 50
+                        # 优先选择文本正好是 "next" 或 "下一页" 的元素
+                        if elem_text in ["next", "下一页", "›", "»", "→"]:
+                            score += 30
+                        # 避免选择包含其他文字的链接（可能是分类链接）
+                        if len(elem_text) > 10:
+                            score -= 20
+
+                        element_id = elem.get("id")
+                        if element_id:
+                            potential_buttons.append({
+                                "id": element_id,
+                                "text": elem_text,
+                                "href": elem_href,
+                                "score": score
+                            })
+                        break
+
+            # 按分数排序，优先点击分数最高的
+            potential_buttons.sort(key=lambda x: x["score"], reverse=True)
+
+            if potential_buttons:
+                logger.info(f"Found {len(potential_buttons)} potential next page buttons")
+                for button in potential_buttons:
+                    logger.info(f"Trying next page button: {button['id']} (text: {button['text']}, href: {button['href']}, score: {button['score']})")
+                    success = await self.executor.click_element_by_id(button["id"])
+                    if success:
+                        return True
+            else:
+                logger.warning("No potential next page buttons found in DOM")
+
+            # 方法3: 使用VLM重新分析页面，专门寻找下一页按钮
+            logger.info("Attempting to find next page button using VLM")
+            next_button_id = await self._find_next_page_button_with_vlm(all_elements, current_url)
+            if next_button_id:
+                logger.info(f"VLM found next page button: {next_button_id}")
+                success = await self.executor.click_element_by_id(next_button_id)
+                if success:
+                    return True
+
+            logger.warning("Could not find or click next page button")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error clicking next page button: {e}")
+            return False
+
+    async def _find_next_page_button_with_vlm(
+        self,
+        dom_elements: List[Dict[str, Any]],
+        current_url: str,
+    ) -> Optional[str]:
+        """
+        使用VLM专门识别"下一页"按钮
+
+        Args:
+            dom_elements: 当前页面的DOM元素列表
+            current_url: 当前页面URL
+
+        Returns:
+            下一页按钮的element_id，如果未找到则返回None
+        """
+        try:
+            # 重新截图
+            screenshot_path = os.path.join(self.data_dir, timestamp_name("screenshot"))
+            await self.executor.screenshot(screenshot_path)
+            import base64
+            with open(screenshot_path, "rb") as f:
+                image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+            # 使用专门的 find_next_page_button 方法
+            result, _ = self.planner.vlm_service.find_next_page_button(
+                annotated_image_base64=image_base64,
+                elements=dom_elements,
+            )
+
+            # 检查返回结果
+            if isinstance(result, dict):
+                next_page_element_id = result.get("next_page_element_id")
+                confidence = result.get("confidence", 0.0)
+
+                if next_page_element_id and confidence > 0.5:
+                    logger.info(f"VLM found next page button: {next_page_element_id} (confidence: {confidence})")
+                    return next_page_element_id
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error finding next page button with VLM: {e}")
+            return None
+
+    async def _smart_scroll_pagination(self) -> bool:
+        """
+        智能滚动翻页（参考 Skyvern）
+
+        使用滚动位置检测来判断是否到达页面底部，
+        并使用带重叠的滚动来确保内容连续性。
+
+        Returns:
+            是否成功滚动（False 表示已到达底部）
+        """
+        try:
+            # 检查页面是否可滚动
+            is_scrollable = await self.executor.is_page_scrollable()
+            if not is_scrollable:
+                logger.info("Page is not scrollable")
+                return False
+
+            # 获取滚动前的位置
+            scroll_info_before = await self.executor.get_scroll_position()
+            scroll_y_before = scroll_info_before.get('scrollY', 0)
+
+            # 检查是否已经到达底部
+            is_at_bottom = await self.executor.is_at_page_bottom(threshold=25)
+            if is_at_bottom:
+                logger.info("Already at page bottom")
+                return False
+
+            # 滚动到下一页（带 200px 重叠）
+            scroll_y_after = await self.executor.scroll_to_next_page(need_overlap=True)
+
+            # 检查滚动是否有效（滚动距离 > 25px）
+            scroll_distance = abs(scroll_y_after - scroll_y_before)
+            if scroll_distance <= 25:
+                logger.info(f"Scroll distance too small ({scroll_distance}px), reached bottom")
+                return False
+
+            logger.info(f"Scrolled from {scroll_y_before}px to {scroll_y_after}px (distance: {scroll_distance}px)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error in smart scroll pagination: {e}")
+            # 降级到简单滚动
+            try:
+                await self.executor.scroll_by(600)
+                return True
+            except Exception:
+                return False

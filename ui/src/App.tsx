@@ -1571,7 +1571,7 @@ function App() {
                         fontWeight: 600,
                         color: "#2e7d32"
                       }}>
-                        {prog.items} items
+                        {String(prog.items)} items
                       </span>
                     )}
                   </div>

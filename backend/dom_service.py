@@ -71,6 +71,23 @@ class DOMService:
             # 注入 JavaScript（如果还没有）
             await page.evaluate(self.dom_marker_js)
 
+            # 先滚动到元素位置（确保元素可见）
+            try:
+                await page.evaluate(f"""
+                    (function() {{
+                        const element = document.querySelector('[unique_id="{element_id}"]');
+                        if (element) {{
+                            element.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                            return true;
+                        }}
+                        return false;
+                    }})()
+                """)
+                # 等待滚动完成
+                await page.wait_for_timeout(500)
+            except Exception as scroll_error:
+                logger.warning(f"Failed to scroll to element {element_id}: {scroll_error}")
+
             # 方法1: 尝试使用 JavaScript 点击
             success = await page.evaluate(f"clickElementById('{element_id}')")
 
@@ -98,6 +115,7 @@ class DOMService:
             try:
                 logger.info(f"Trying Playwright locator click for element {element_id}")
                 locator = page.locator(f"[unique_id='{element_id}']")
+                await locator.scroll_into_view_if_needed(timeout=5000)
                 await locator.click(timeout=5000)
                 logger.info(f"Playwright locator click succeeded for {element_id}")
                 return True

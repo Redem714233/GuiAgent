@@ -31,6 +31,11 @@ class VLMService:
             "IMPORTANT: When you see a red box with an ID number in the image, use that ID directly. "
             "For example, if you see a button with ID '48' in the image, return {'tool': 'click', 'id': 48}. "
             "\n\n"
+            "PAGINATION BUTTONS: If the task involves going to next/previous page (e.g., '翻页', '下一页', 'next page'), "
+            "look for pagination buttons with text like 'next', 'prev', 'previous', '下一页', '上一页', or page numbers. "
+            "These buttons often have HIGH PRIORITY and appear at the top of the elements list. "
+            "Click the pagination button BEFORE extracting data from the next page. "
+            "\n\n"
             "Use exactly one tool from: click, type, press, wait, copy, goto, scroll. "
             "Return JSON with keys: 'tool', and optionally 'id', 'point', 'text', 'key', 'ms', 'url', 'scroll'. "
             "- 'id' is the NUMBER shown in the red box on the image (e.g., 48, not 'skyvern-48'). "
@@ -42,7 +47,7 @@ class VLMService:
             "- 'scroll' is delta-y pixels; positive to scroll down. "
             "\n\n"
             "Decision priority: "
-            "1. If you see a red box with ID in the image → use 'id' "
+            "1. If you see a red box with ID in the image �� use 'id' "
             "2. If no clear ID but you see the target → use 'point' "
             "3. If you can directly open a target site → use 'goto' with 'url' "
             "\n\n"
@@ -135,6 +140,13 @@ class VLMService:
             "Each step must be a single action the agent can attempt on the current page. "
             "Prefer direct navigation when a target site is clear (e.g., 'goto https://example.com'). "
             "Only include search + typing steps when a direct URL is unknown. "
+            "\n\n"
+            "IMPORTANT - Pagination tasks: "
+            "If the task mentions going to next/previous page (e.g., '翻到第二页', '下一页', 'go to page 2', 'next page'), "
+            "you MUST include a step to click the pagination button BEFORE extracting data. "
+            "Example: Task '访问网站，翻到第二页，提取数据' should become: "
+            "['goto https://...', 'click next page button', 'extract data from page']. "
+            "\n\n"
             "Keep steps minimal and explicit. "
             "Return JSON with key 'steps' as a list of strings. "
             "Do not include confirmations or meta commentary."
@@ -258,8 +270,20 @@ class VLMService:
             "    },\n"
             "    ...\n"
             "  ],\n"
-            "  'next': 'scroll' | 'next_page' | 'stop'\n"
+            "  'next': 'scroll' | 'next_page' | 'stop',\n"
+            "  'next_page_element_id': str  // OPTIONAL: element_id of the 'Next Page' button (ONLY if next='next_page')\n"
             "}\n\n"
+            "CRITICAL - Pagination Detection Rules:\n"
+            "- ALWAYS check for pagination controls at the bottom of the page\n"
+            "- If you see ANY of these, set next='next_page' and provide next_page_element_id:\n"
+            "  * 'Next' button or link\n"
+            "  * '下一页' button or link\n"
+            "  * Arrow symbols: '›', '»', '→'\n"
+            "  * Numbered page links (1, 2, 3...) with a clickable next number\n"
+            "  * 'Load More' or 'Show More' buttons\n"
+            "- Only set next='scroll' if there's NO pagination control but content might load on scroll\n"
+            "- Only set next='stop' if you're certain there's no more content AND no pagination\n"
+            "- When in doubt between 'scroll' and 'next_page', prefer 'next_page' if any pagination UI is visible\n\n"
             "Field extraction rules (extract ONLY what is CLEARLY VISIBLE):\n"
             "- title: Main title/headline (required)\n"
             "- url: Link URL (ONLY if visible as text in the image)\n"
@@ -346,7 +370,14 @@ class VLMService:
             "- Extract numbers without units when possible (rating: '9.7' not '★★★★☆ 9.7')\n"
             "- Each field should contain ONLY its designated data type (don't mix fields)\n"
             "- For tags: Extract as a simple string (e.g., 'Python') or omit if not applicable\n"
-            "- Set 'next' to 'scroll' if more content might load below, 'next_page' if there's a next page button, 'stop' if at the end\n\n"
+            "- Set 'next' to 'scroll' if more content might load below, 'next_page' if there's a next page button, 'stop' if at the end\n"
+            "- IMPORTANT: If you set 'next' to 'next_page', you MUST also provide 'next_page_element_id':\n"
+            "  * Look for pagination controls at the bottom of the page\n"
+            "  * Common next page button texts: '下一页', 'Next', 'Next Page', '›', '»', '→', '下页', 'nextpage'\n"
+            "  * Common pagination patterns: numbered pages (1, 2, 3...), arrow buttons, 'Load More' buttons\n"
+            "  * Find the element_id from the provided elements list that corresponds to the next page button\n"
+            "  * The element should be clickable (usually <a>, <button>, or <div> with click handler)\n"
+            "  * Prefer elements with clear 'next' semantics over generic numbered page links\n\n"
             "If mode is 'detail', return:\n"
             "{\n"
             "  'data': {\n"
@@ -493,3 +524,237 @@ class VLMService:
 
         content = resp.choices[0].message.content or ""
         return self._extract_json(content), content
+
+    def find_next_page_button(
+        self,
+        *,
+        annotated_image_base64: str,
+        elements: list[dict],
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        专门用于识别翻页按钮的方法
+
+        Args:
+            annotated_image_base64: 标注后的页面截图
+            elements: 页面元素列表
+
+        Returns:
+            ({"next_page_element_id": str | None, "confidence": float}, raw_response)
+        """
+        prompt = (
+            "Find the 'Next Page' button in the image. "
+            "Look for pagination controls at the bottom of the page.\n\n"
+            "Common next page button indicators:\n"
+            "- Text: '下一页', 'Next', 'Next Page', '›', '»', '→', '下页', 'nextpage', 'page-next', 'pagination-next'\n"
+            "- Visual: Arrow pointing right, numbered pagination with highlighted next number\n"
+            "- Position: Usually at the bottom of the page, in pagination controls\n\n"
+            "Return JSON format:\n"
+            "{\n"
+            "  'next_page_element_id': str,  // Element ID from the provided list, or null if not found\n"
+            "  'confidence': float,  // 0.0-1.0, confidence in the selection\n"
+            "  'button_type': str  // 'text_button' | 'arrow_button' | 'numbered_page' | 'load_more' | 'none'\n"
+            "}\n\n"
+            "IMPORTANT:\n"
+            "- Only select element IDs from the provided elements list\n"
+            "- If no clear next page button is found, return null for next_page_element_id\n"
+            "- Prefer explicit 'Next' buttons over numbered page links\n"
+            "- Avoid selecting 'Previous' or 'Last Page' buttons"
+        )
+
+        # Build elements text
+        elements_text = "Available interactive elements:\n"
+        for elem in elements[:50]:
+            elem_id = elem.get('id', '')
+            tag = elem.get('tagName', '')
+            text = elem.get('text', '')[:100]
+            href = elem.get('attributes', {}).get('href', '')
+
+            elements_text += f"- {elem_id} ({tag}): \"{text}\""
+            if href:
+                elements_text += f" [href: {href}]"
+            elements_text += "\n"
+
+        user_payload = {"elements": elements_text}
+        data_url = f"data:image/png;base64,{annotated_image_base64}"
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)},
+                    ],
+                },
+            ],
+            temperature=0.1,
+        )
+
+        content = resp.choices[0].message.content or ""
+        return self._extract_json(content), content
+
+    def verify_step_success(
+        self,
+        *,
+        task: str,
+        step_description: str,
+        action_taken: str,
+        before_url: str,
+        after_url: str,
+        before_image_base64: str | None = None,
+        after_image_base64: str | None = None,
+        elements_before: list[dict] | None = None,
+        elements_after: list[dict] | None = None,
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        验证步骤是否成功执行（类似 Skyvern 的 complete_verify）
+
+        返回:
+        {
+            "success": bool,
+            "reasoning": str,
+            "status": "success" | "failed" | "uncertain",
+            "should_retry": bool,
+            "next_action": "continue" | "retry" | "complete"
+        }
+        """
+        prompt = (
+            "You are verifying if a UI automation step was executed successfully. "
+            "Compare the page state BEFORE and AFTER the action to determine if the intended goal was achieved.\n\n"
+
+            f"Task: {task}\n"
+            f"Step description: {step_description}\n"
+            f"Action taken: {action_taken}\n\n"
+
+            "BEFORE state:\n"
+            f"- URL: {before_url}\n"
+            f"- Elements count: {len(elements_before) if elements_before else 0}\n\n"
+
+            "AFTER state:\n"
+            f"- URL: {after_url}\n"
+            f"- Elements count: {len(elements_after) if elements_after else 0}\n\n"
+
+            "Verification criteria:\n"
+            "1. URL change: Did the URL change as expected?\n"
+            "   - For navigation/click: URL should change\n"
+            "   - For typing/form input: URL may not change\n"
+            "   - For pagination: URL should change to next page\n\n"
+
+            "2. Page content change: Did the page content change?\n"
+            "   - Compare elements before and after\n"
+            "   - Check if new content appeared\n"
+            "   - Check if expected elements are now visible\n\n"
+
+            "3. Visual change: Do the screenshots show the expected change?\n"
+            "   - Compare before and after images\n"
+            "   - Look for visual indicators of success\n\n"
+
+            "Return JSON with:\n"
+            "{\n"
+            "  'success': bool,\n"
+            "  'reasoning': str,\n"
+            "  'status': 'success' | 'failed' | 'uncertain',\n"
+            "  'should_retry': bool,\n"
+            "  'next_action': 'continue' | 'retry' | 'complete'\n"
+            "}\n\n"
+
+            "Examples:\n"
+            "- Click 'next' button → URL changed from page-1 to page-2 → success=true, next_action='continue'\n"
+            "- Click 'next' button → URL unchanged → success=false, should_retry=true, next_action='retry'\n"
+            "- Type in search box → Input field now has text → success=true, next_action='continue'\n"
+            "- Click link → Got 404 error page → success=false, should_retry=false, next_action='complete'\n"
+        )
+
+        content_parts = [{"type": "text", "text": prompt}]
+
+        # 添加前后对比图片
+        if before_image_base64:
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{before_image_base64}"}
+            })
+        if after_image_base64:
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{after_image_base64}"}
+            })
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "user", "content": content_parts}
+            ],
+            temperature=0.1,
+        )
+
+        content = resp.choices[0].message.content or ""
+        result = self._extract_json(content)
+
+        # 确保返回必需的字段
+        if not isinstance(result, dict):
+            result = {
+                "success": False,
+                "reasoning": "Failed to parse verification result",
+                "status": "uncertain",
+                "should_retry": True,
+                "next_action": "retry"
+            }
+
+        return result, content
+
+    def find_next_page_button(
+        self,
+        *,
+        annotated_image_base64: str,
+        elements: List[Dict[str, Any]],
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        找到"下一页"按钮的 element_id
+
+        Args:
+            annotated_image_base64: 标注后的页面截图
+            elements: DOM 元素列表
+
+        Returns:
+            (result_dict, raw_response)
+            result_dict: {"next_page_element_id": str | None}
+        """
+        prompt = (
+            "Find the 'next page' button on this page. "
+            "Look for buttons with text like 'next', '下一页', '›', '>>', 'Next Page', etc. "
+            "\n\n"
+            "Return JSON with key:\n"
+            "- next_page_element_id (str): The element_id of the next page button, or null if not found\n"
+        )
+
+        user_payload = {
+            "elements": elements[:50],  # 限制元素数量
+        }
+
+        data_url = f"data:image/png;base64,{annotated_image_base64}"
+        content_parts = [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": json.dumps(user_payload, ensure_ascii=False)},
+        ]
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content_parts},
+            ],
+            temperature=0.0,
+        )
+
+        content = resp.choices[0].message.content or ""
+        parsed = self._extract_json(content)
+
+        if isinstance(parsed, dict):
+            return parsed, content
+        else:
+            return {"next_page_element_id": None}, content

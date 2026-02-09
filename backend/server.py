@@ -760,19 +760,28 @@ async def run_extraction(request: RunExtractionRequest) -> RunExtractionResponse
     自动执行：
     1. 解析任务规格
     2. 导航到目标网站
-    3. 循环提取列表数据（支持滚动/翻页）
-    4. 可选：进入详情页提取详细数据
+    3. 循环��取列表数据（支持滚动/翻页）
+    4. 可选：��入详情页提取详细数据
     5. 保存到Excel
+
+    新增：use_reflection 参数
+    - 启用后，翻页时会使用反思机制（验证+重试）
+    - 默认启用，确保翻页可靠性
 
     示例任务:
     - "进入新浪新闻，复制今天的前10条新闻标题和内容"
     - "打开哔哩哔哩，随机进入一个视频，复制最上方的一条评论"
+    - "访问https://books.toscrape.com，翻到第二页，提取2本书"
     """
+    # 从请求中获取 use_reflection 参数（默认为 True）
+    use_reflection = getattr(request, 'use_reflection', True)
+
     result = await extraction_engine.run_extraction(
         task=request.task,
         max_items=request.max_items,
         strategy=request.strategy,
         use_omniparser=request.use_omniparser,
+        use_reflection=use_reflection,
     )
     return RunExtractionResponse(**result)
 
@@ -793,3 +802,60 @@ def get_extraction_progress() -> dict:
         "progress": extraction_engine.current_progress,
     }
 
+
+@app.post("/run_with_reflection")
+async def run_with_reflection(request: dict) -> dict:
+    """
+    使用反思机制执行任务（类似 Skyvern）
+
+    流程：规划 → 执行 → 验�� → 决策（重试/继续/完成）
+
+    请求参数:
+    {
+        "task": str,  # 任务描述
+        "max_steps": int,  # 最大步数（默认10）
+        "max_retries_per_step": int  # 每步最大重试次数（默认3）
+    }
+
+    返回:
+    {
+        "status": "success" | "partial" | "failed",
+        "steps": [
+            {
+                "step_index": int,
+                "retry_index": int,
+                "description": str,
+                "action": str,
+                "before_url": str,
+                "after_url": str,
+                "verification": {...},
+                "status": "success" | "failed"
+            }
+        ],
+        "final_url": str,
+        "reasoning": str,
+        "plan": [str]
+    }
+    """
+    from .reflection_engine import ReflectionEngine
+
+    task = request.get("task", "")
+    max_steps = request.get("max_steps", 10)
+    max_retries_per_step = request.get("max_retries_per_step", 3)
+
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+
+    # 创建反思引擎
+    reflection_engine = ReflectionEngine(
+        executor=executor,
+        planner=planner,
+        vlm=planner.vlm,
+        max_steps=max_steps,
+        max_retries_per_step=max_retries_per_step,
+    )
+
+    # 执行任务
+    result = await reflection_engine.run_task_with_reflection(task=task)
+
+    return result

@@ -246,6 +246,7 @@ function isVisible(element) {
     }
 
     // 检查是否在视口内（至少部分可见）
+    // 这是 Skyvern 的设计：只标记当前视口内的元素
     if (rect.bottom < 0 || rect.top > window.innerHeight ||
         rect.right < 0 || rect.left > window.innerWidth) {
         return false;
@@ -309,6 +310,56 @@ function hasAngularClickBinding(element) {
 function isHoverPointerElement(element) {
     const style = window.getComputedStyle(element);
     return style && style.cursor === 'pointer';
+}
+
+/**
+ * 检查元素是否是翻页按钮
+ * @param {Element} element - DOM 元素
+ * @returns {boolean} - 是否是翻页按钮
+ */
+function isPaginationElement(element) {
+    // 只检查可点击的元素（链接和按钮）
+    const tagName = element.tagName.toLowerCase();
+    if (tagName !== 'a' && tagName !== 'button') {
+        return false;
+    }
+
+    // 使用 innerText 而不是 textContent，只获取直接文本，不包含子元素
+    const text = (element.innerText || element.textContent || '').toLowerCase().trim();
+    const href = (element.href || '').toLowerCase();
+    const className = (element.className || '').toLowerCase();
+    const ariaLabel = (element.getAttribute('aria-label') || '').toLowerCase();
+
+    // 翻页关键词
+    const paginationKeywords = [
+        'next', 'prev', 'previous', 'page',
+        '下一页', '上一页', '翻页',
+        '›', '»', '‹', '«', '→', '←'
+    ];
+
+    // 检查文本内容（文本要短，避免匹配到包含很多内容的父元素）
+    if (text.length > 50) {
+        return false;
+    }
+
+    // 检查文本内容
+    for (const keyword of paginationKeywords) {
+        if (text.includes(keyword) ||
+            href.includes(keyword) ||
+            className.includes(keyword) ||
+            ariaLabel.includes(keyword)) {
+            console.log(`[DEBUG] Found pagination element: tag="${tagName}", text="${text.substring(0, 50)}", href="${href}"`);
+            return true;
+        }
+    }
+
+    // 检查 class 是否包含 pagination 相关
+    if (className.includes('pag') || className.includes('nav')) {
+        console.log(`[DEBUG] Found pagination element by class: "${className}"`);
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -515,10 +566,43 @@ function markAndExtractElements() {
     // 获取所有元素
     const allElements = document.querySelectorAll('*');
     const candidateElements = [];
+    const paginationElements = [];  // 单独存储翻页按钮
 
     // 遍历所有元素
     for (const element of allElements) {
-        // 检查是否可见和可交互（使用增强版函数）
+        // 检查是否是翻页按钮（翻页按钮单独处理）
+        const isPaginationButton = isPaginationElement(element);
+
+        if (isPaginationButton) {
+            // 翻页按钮：跳过视口检查，只检查基本可见性
+            // 检查 display 和 visibility
+            const style = window.getComputedStyle(element);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                continue;
+            }
+
+            // 检查尺寸
+            const rect = element.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {
+                continue;
+            }
+
+            const area = rect.width * rect.height;
+
+            // 分配唯一 ID
+            const id = assignUniqueId(element);
+
+            // 构建元素信息
+            const elementInfo = buildElementInfo(element);
+            elementInfo.priority = 1000;  // 给翻页按钮最高优先级
+            elementInfo.area = area;
+
+            console.log(`[DEBUG] Pagination button added: ${id}, text="${elementInfo.text.substring(0, 50)}", href="${elementInfo.attributes.href}"`);
+            paginationElements.push(elementInfo);
+            continue;  // 跳过后续的常规检查
+        }
+
+        // 常规元素：应用所有过滤规则
         if (!isVisible(element) || !isInteractable(element)) {
             continue;
         }
@@ -572,11 +656,26 @@ function markAndExtractElements() {
     // 按面积排序（大元素优先，用于四叉树插入）
     candidateElements.sort((a, b) => b.area - a.area);
 
+    console.log(`[DEBUG] Total candidate elements: ${candidateElements.length}`);
+    console.log(`[DEBUG] Total pagination elements: ${paginationElements.length}`);
+
     // 使用四叉树进行空间管理和重叠过滤
     const filteredElements = filterOverlappingElementsWithQuadTree(candidateElements, 0.5);
 
-    // 限制最多 30 个元素（更少更精准）
-    const finalElements = filteredElements.slice(0, 30);
+    console.log(`[DEBUG] After QuadTree filtering: ${filteredElements.length}`);
+
+    // 合并翻页按钮（翻页按钮不参与四叉树过滤）
+    const combinedElements = [...paginationElements, ...filteredElements];
+
+    // 限制最多 30 个元素（但翻页按钮始终保留）
+    // 如果翻页按钮 + 常规元素 > 30，则只保留前 (30 - 翻页按钮数量) 个常规元素
+    const maxRegularElements = Math.max(0, 30 - paginationElements.length);
+    const finalElements = [
+        ...paginationElements,
+        ...filteredElements.slice(0, maxRegularElements)
+    ];
+
+    console.log(`[DEBUG] Final elements: ${finalElements.length} (${paginationElements.length} pagination + ${finalElements.length - paginationElements.length} regular)`);
 
     // 按优先级重新排序（用于 VLM 列表显示）
     finalElements.sort((a, b) => b.priority - a.priority);
@@ -810,6 +909,12 @@ function clickElementById(uniqueId) {
     }
 
     try {
+        // 先滚动到元素位置，确保元素可见
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+        // 等待一小段时间让滚动完成
+        // 注意：这里不能用 setTimeout，因为是同步函数
+
         // 方法1: 尝试使用原生 click() 方法
         if (typeof element.click === 'function') {
             element.click();
@@ -865,6 +970,9 @@ function clickElementById(uniqueId) {
 function getElementCenter(uniqueId) {
     const element = findElementById(uniqueId);
     if (element) {
+        // 先滚动到元素位置，确保元素可见
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
         const rect = element.getBoundingClientRect();
         return {
             x: Math.round(rect.left + rect.width / 2),
@@ -874,6 +982,104 @@ function getElementCenter(uniqueId) {
     return null;
 }
 
+// ============================================================================
+// 翻页和滚动功能（参考 Skyvern）
+// ============================================================================
+
+/**
+ * 检查窗口是否可滚动
+ * @returns {boolean} - 页面是否可滚动
+ */
+function isWindowScrollable() {
+    const documentBody = document.body;
+    const documentElement = document.documentElement;
+    if (!documentBody || !documentElement) {
+        return false;
+    }
+
+    // 检查 body 的 overflow 样式是否为 hidden
+    const bodyStyle = window.getComputedStyle(documentBody);
+    const htmlStyle = window.getComputedStyle(documentElement);
+    const bodyOverflow = bodyStyle?.overflow;
+    const htmlOverflow = htmlStyle?.overflow;
+
+    // 检查文档高度是否大于窗口高度
+    const isScrollable = document.documentElement.scrollHeight > window.innerHeight;
+
+    // 如果 overflow 为 hidden 或没有内容可滚动，返回 false
+    if (bodyOverflow === "hidden" || htmlOverflow === "hidden" || !isScrollable) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * 获取滚动宽度和高度
+ * @returns {Object} - {scrollWidth, scrollHeight, scrollX, scrollY}
+ */
+function getScrollWidthAndHeight() {
+    return {
+        scrollWidth: document.documentElement.scrollWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        scrollX: window.scrollX || window.pageXOffset,
+        scrollY: window.scrollY || window.pageYOffset,
+    };
+}
+
+/**
+ * 安全滚动函数
+ * @param {number} x - 水平滚动位置
+ * @param {number} y - 垂直滚动位置
+ */
+function safeWindowScroll(x, y) {
+    if (typeof window.scroll === "function") {
+        window.scroll({ left: x, top: y, behavior: "instant" });
+    } else if (typeof window.scrollTo === "function") {
+        window.scrollTo({ left: x, top: y, behavior: "instant" });
+    }
+}
+
+/**
+ * 滚动到页面顶部
+ * @returns {number} - 当前滚动位置
+ */
+function safeScrollToTop() {
+    safeWindowScroll(0, 0);
+    return window.scrollY || window.pageYOffset;
+}
+
+/**
+ * 滚动到下一页
+ * @param {boolean} needOverlap - 是否需要 200px 重叠（默认 true）
+ * @returns {number} - 当前滚动位置
+ */
+function scrollToNextPage(needOverlap = true) {
+    // 计算滚动距离：如果需要重叠，则保留 200px
+    const scrollDistance = needOverlap ? window.innerHeight - 200 : window.innerHeight;
+
+    window.scrollBy({
+        left: 0,
+        top: scrollDistance,
+        behavior: "instant",
+    });
+
+    return window.scrollY || window.pageYOffset;
+}
+
+/**
+ * 检测是否到达页面底部
+ * @param {number} threshold - 阈值（默认 25px）
+ * @returns {boolean} - 是否到达底部
+ */
+function isAtPageBottom(threshold = 25) {
+    const scrollY = window.scrollY || window.pageYOffset;
+    const windowHeight = window.innerHeight;
+    const documentHeight = document.documentElement.scrollHeight;
+
+    return (scrollY + windowHeight) >= (documentHeight - threshold);
+}
+
 // 导出函数供 Python 调用
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
@@ -881,5 +1087,10 @@ if (typeof module !== 'undefined' && module.exports) {
         findElementById,
         clickElementById,
         getElementCenter,
+        isWindowScrollable,
+        getScrollWidthAndHeight,
+        safeScrollToTop,
+        scrollToNextPage,
+        isAtPageBottom,
     };
 }

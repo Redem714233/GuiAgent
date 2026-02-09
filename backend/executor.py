@@ -65,12 +65,51 @@ class Executor:
                 launch_kwargs["executable_path"] = self._executable
 
         self._browser = await browser_type.launch(**launch_kwargs)
-        self._context = await self._browser.new_context(
-            viewport={"width": self._viewport_width, "height": self._viewport_height},
-            device_scale_factor=self._device_scale_factor,
-        )
+
+        # 创建更真实的浏览器上下文（反反爬虫）
+        context_options = {
+            "viewport": {"width": self._viewport_width, "height": self._viewport_height},
+            "device_scale_factor": self._device_scale_factor,
+            # 添加真实的 User-Agent
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            # 添加常见的浏览器 headers
+            "extra_http_headers": {
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            },
+            # 允许地理位置、通知等权限
+            "permissions": ["geolocation", "notifications"],
+            # 设置时区
+            "timezone_id": "Asia/Shanghai",
+            # 设置语言
+            "locale": "zh-CN",
+        }
+
+        self._context = await self._browser.new_context(**context_options)
         self._context.on("page", self._on_new_page)
         self._page = await self._context.new_page()
+
+        # 注入反检测脚本（隐藏 webdriver 特征）
+        await self._page.add_init_script("""
+            // 覆盖 navigator.webdriver
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+
+            // 覆盖 chrome 对象
+            window.chrome = {
+                runtime: {}
+            };
+
+            // 覆盖 permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
+
         if self._start_url:
             await self._page.goto(self._start_url)
 
@@ -295,6 +334,16 @@ class Executor:
             await self._restart()
             await self._ensure_page()
             await self._page.evaluate("y => window.scrollTo(0, y)", y)
+
+    async def scroll_to_bottom(self) -> None:
+        """滚动到页面底部"""
+        await self._ensure_page()
+        try:
+            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            await self._restart()
+            await self._ensure_page()
+            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
     async def go_back(self) -> None:
         await self._ensure_page()
@@ -631,3 +680,180 @@ class Executor:
         """
         await self._ensure_page()
         return await self.dom_service.get_element_center(self._page, element_id)
+
+    # ========================================================================
+    # 翻页和滚动方法（参考 Skyvern）
+    # ========================================================================
+
+    async def is_page_scrollable(self) -> bool:
+        """
+        检查页面是否可滚动
+
+        Returns:
+            是否可滚动
+        """
+        await self._ensure_page()
+        try:
+            # 先注入 JavaScript
+            await self._page.evaluate(self.dom_service.dom_marker_js)
+            result = await self._page.evaluate("() => isWindowScrollable()")
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"Failed to check if page is scrollable: {e}")
+            return False
+
+    async def get_scroll_position(self) -> dict:
+        """
+        获取当前滚动位置和页面尺寸
+
+        Returns:
+            {
+                'scrollWidth': int,
+                'scrollHeight': int,
+                'scrollX': int,
+                'scrollY': int
+            }
+        """
+        await self._ensure_page()
+        try:
+            # 先注入 JavaScript
+            await self._page.evaluate(self.dom_service.dom_marker_js)
+            result = await self._page.evaluate("() => getScrollWidthAndHeight()")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get scroll position: {e}")
+            return {'scrollWidth': 0, 'scrollHeight': 0, 'scrollX': 0, 'scrollY': 0}
+
+    async def scroll_to_top(self) -> float:
+        """
+        滚动到页面顶部
+
+        Returns:
+            当前滚动位置（应该是 0）
+        """
+        await self._ensure_page()
+        try:
+            # 先注入 JavaScript
+            await self._page.evaluate(self.dom_service.dom_marker_js)
+            await self._page.evaluate("() => safeScrollToTop()")
+            logger.info(f"Scrolled to top")
+            return 0.0
+        except Exception as e:
+            logger.error(f"Failed to scroll to top: {e}")
+            return 0.0
+
+    async def scroll_to_next_page(self, need_overlap: bool = True) -> float:
+        """
+        滚动到下一页（带重叠）
+
+        Args:
+            need_overlap: 是否需要 200px 重叠（默认 True）
+
+        Returns:
+            当前滚动位置
+        """
+        await self._ensure_page()
+        try:
+            # 先注入 JavaScript
+            await self._page.evaluate(self.dom_service.dom_marker_js)
+            scroll_y = await self._page.evaluate(
+                "(needOverlap) => scrollToNextPage(needOverlap)",
+                need_overlap
+            )
+            logger.info(f"Scrolled to next page, current position: {scroll_y}")
+            return float(scroll_y)
+        except Exception as e:
+            logger.error(f"Failed to scroll to next page: {e}")
+            return 0.0
+
+    async def is_at_page_bottom(self, threshold: int = 25) -> bool:
+        """
+        检测是否到达页面底部
+
+        Args:
+            threshold: 阈值（默认 25px）
+
+        Returns:
+            是否到达底部
+        """
+        await self._ensure_page()
+        try:
+            result = await self._page.evaluate(
+                "(threshold) => isAtPageBottom(threshold)",
+                threshold
+            )
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"Failed to check if at page bottom: {e}")
+            return False
+
+    # ========================================================================
+    # Cookie 管理方法（反反爬虫）
+    # ========================================================================
+
+    async def save_cookies(self, file_path: str) -> None:
+        """
+        保存当前浏览器的 Cookies 到文件
+
+        Args:
+            file_path: Cookie 文件路径（JSON 格式）
+        """
+        await self._ensure_page()
+        import json
+        cookies = await self._context.cookies()
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        logger.info(f"Cookies saved to {file_path}")
+
+    async def load_cookies(self, file_path: str) -> None:
+        """
+        从文件加载 Cookies 到浏览器
+
+        Args:
+            file_path: Cookie 文件路径（JSON 格式）
+        """
+        await self._ensure_page()
+        import json
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+            await self._context.add_cookies(cookies)
+            logger.info(f"Cookies loaded from {file_path}")
+        except FileNotFoundError:
+            logger.warning(f"Cookie file not found: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to load cookies: {e}")
+
+    async def wait_for_manual_login(self, timeout_seconds: int = 300) -> bool:
+        """
+        等待用户手动登录（用于需要登录的网站）
+
+        Args:
+            timeout_seconds: 等待超时时间（秒）
+
+        Returns:
+            是否成功登录（通过 URL 变化判断）
+        """
+        await self._ensure_page()
+        import asyncio
+
+        logger.info(f"Waiting for manual login (timeout: {timeout_seconds}s)...")
+        logger.info("Please login in the browser window, then the script will continue automatically.")
+
+        start_url = self._page.url
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            await asyncio.sleep(2)
+            current_url = self._page.url
+
+            # 检查 URL 是否变化（通常登录后会跳转）
+            if current_url != start_url and "login" not in current_url.lower():
+                logger.info(f"Login detected! URL changed to: {current_url}")
+                return True
+
+            # 检查超时
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout_seconds:
+                logger.warning(f"Manual login timeout after {timeout_seconds}s")
+                return False
