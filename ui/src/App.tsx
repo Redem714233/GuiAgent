@@ -331,180 +331,747 @@ function App() {
   }, []);
 
   return (
-    <div style={{ fontFamily: "sans-serif", padding: 16, display: "grid", gap: 12 }}>
-      <h2>GUIAgent Local</h2>
-      <div style={{ display: "grid", gap: 8 }}>
-        <label>Task</label>
-        <textarea
-          rows={3}
-          value={task}
-          onChange={(e) => setTask(e.target.value)}
-          style={{ width: "100%" }}
-        />
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <button onClick={handleRun} disabled={loading}>
-            Run
-          </button>
-          <button onClick={handleTaskSpec} disabled={loading}>
-            Task Spec
-          </button>
-          <button
-            onClick={handleNextStep}
-            disabled={loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1}
-          >
-            下一步
-          </button>
-          <button onClick={handleRunExtraction} disabled={extractionLoading || loading}>
-            🚀 开始提取
-          </button>
-          <input
-            type="number"
-            value={maxItems}
-            onChange={(e) => setMaxItems(Math.max(1, Math.min(100, parseInt(e.target.value) || 10)))}
-            style={{ width: 60, padding: "4px 8px" }}
-            min={1}
-            max={100}
-            disabled={extractionLoading}
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+      padding: "32px 24px"
+    }}>
+      <div style={{
+        maxWidth: 1400,
+        margin: "0 auto",
+        display: "grid",
+        gap: 24
+      }}>
+        {/* Header */}
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: "24px 32px",
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          animation: "fadeIn 0.5s ease-out"
+        }}>
+          <h1 style={{
+            fontSize: 32,
+            fontWeight: 700,
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+            marginBottom: 8
+          }}>
+            GUIAgent Local
+          </h1>
+          <p style={{ color: "#666", fontSize: 14 }}>Intelligent GUI</p>
+        </div>
+
+        {/* Task Input Card */}
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          animation: "fadeIn 0.5s ease-out 0.1s backwards"
+        }}>
+          <label style={{
+            display: "block",
+            fontWeight: 600,
+            marginBottom: 12,
+            fontSize: 15,
+            color: "#333"
+          }}>
+            📝 Task Description
+          </label>
+          <textarea
+            rows={3}
+            value={task}
+            onChange={(e) => setTask(e.target.value)}
+            style={{
+              width: "100%",
+              padding: 12,
+              border: "2px solid #e0e0e0",
+              borderRadius: 8,
+              fontSize: 14,
+              fontFamily: "inherit",
+              resize: "vertical",
+              transition: "all 0.2s",
+              outline: "none"
+            }}
+            onFocus={(e) => e.target.style.borderColor = "#667eea"}
+            onBlur={(e) => e.target.style.borderColor = "#e0e0e0"}
+            placeholder="Enter your automation task here..."
           />
-          <span style={{ fontSize: 12, color: "#666" }}>条</span>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, cursor: "pointer" }}>
+
+          {/* Action Buttons */}
+          <div style={{
+            display: "flex",
+            gap: 12,
+            alignItems: "center",
+            flexWrap: "wrap",
+            marginTop: 16
+          }}>
+            <button
+              onClick={handleRun}
+              disabled={loading}
+              style={{
+                padding: "10px 20px",
+                background: loading ? "#ccc" : "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                color: "white",
+                border: "none",
+                borderRadius: 8,
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: loading ? "not-allowed" : "pointer",
+                transition: "all 0.2s",
+                boxShadow: loading ? "none" : "0 4px 12px rgba(102, 126, 234, 0.3)",
+                transform: loading ? "none" : "translateY(0)",
+              }}
+              onMouseEnter={(e) => !loading && (e.currentTarget.style.transform = "translateY(-2px)")}
+              onMouseLeave={(e) => !loading && (e.currentTarget.style.transform = "translateY(0)")}
+            >
+              {loading ? "⏳ Running..." : "▶️ Run"}
+            </button>
+
+            <button
+              onClick={handleTaskSpec}
+              disabled={loading}
+              style={{
+                padding: "10px 20px",
+                background: "white",
+                color: "#667eea",
+                border: "2px solid #667eea",
+                borderRadius: 8,
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: loading ? "not-allowed" : "pointer",
+                transition: "all 0.2s",
+                opacity: loading ? 0.5 : 1
+              }}
+              onMouseEnter={(e) => !loading && (e.currentTarget.style.background = "#f5f7ff")}
+              onMouseLeave={(e) => !loading && (e.currentTarget.style.background = "white")}
+            >
+              📋 Task Spec
+            </button>
+
+            <button
+              onClick={handleNextStep}
+              disabled={loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1}
+              style={{
+                padding: "10px 20px",
+                background: (loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1) ? "#e0e0e0" : "#4caf50",
+                color: "white",
+                border: "none",
+                borderRadius: 8,
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: (loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1) ? "not-allowed" : "pointer",
+                transition: "all 0.2s",
+                opacity: (loading || planSteps.length === 0 || currentStepIndex >= planSteps.length - 1) ? 0.5 : 1
+              }}
+            >
+              ⏭️ Next Step
+            </button>
+
+            <button
+              onClick={handleRunExtraction}
+              disabled={extractionLoading || loading}
+              style={{
+                padding: "10px 20px",
+                background: (extractionLoading || loading) ? "#e0e0e0" : "#ff6b00",
+                color: "white",
+                border: "none",
+                borderRadius: 8,
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: (extractionLoading || loading) ? "not-allowed" : "pointer",
+                transition: "all 0.2s",
+                opacity: (extractionLoading || loading) ? 0.5 : 1
+              }}
+            >
+              🚀 Extract Data
+            </button>
+
             <input
-              type="checkbox"
-              checked={useOmniparser}
-              onChange={(e) => setUseOmniparser(e.target.checked)}
+              type="number"
+              value={maxItems}
+              onChange={(e) => setMaxItems(Math.max(1, Math.min(100, parseInt(e.target.value) || 10)))}
+              style={{
+                width: 70,
+                padding: "8px 12px",
+                border: "2px solid #e0e0e0",
+                borderRadius: 8,
+                fontSize: 14,
+                textAlign: "center"
+              }}
+              min={1}
+              max={100}
               disabled={extractionLoading}
             />
-            <span>使用标注图</span>
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 13, cursor: "pointer" }}>
-            <input
-              type="checkbox"
-              checked={listOnly}
-              onChange={(e) => setListOnly(e.target.checked)}
-              disabled={extractionLoading}
-            />
-            <span>仅列表(快速)</span>
-          </label>
-          <button onClick={handleRefreshFiles} disabled={loading}>
-            刷新文件
-          </button>
-          <span>{status}</span>
-        </div>
-        <div style={{ fontSize: 12, color: "#555" }}>
-          URL: {currentUrl || "(unknown)"}
-        </div>
-      </div>
+            <span style={{ fontSize: 13, color: "#666", fontWeight: 500 }}>items</span>
 
-      <div style={{ display: "grid", gap: 6, maxWidth: 1200 }}>
-        <div style={{ fontWeight: 600 }}>Steps</div>
-        {planSteps.length === 0 ? (
-          <div style={{ fontSize: 12, color: "#666" }}>No steps yet. Click Run.</div>
-        ) : (
-          <div style={{ display: "grid", gap: 4 }}>
-            {planSteps.map((step, idx) => {
-              const isActive = idx === currentStepIndex;
-              const isDone = idx < currentStepIndex;
-              const color = isActive ? "#1e90ff" : isDone ? "#2e7d32" : "#666";
-              return (
-                <div
-                  key={`${idx}-${step}`}
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: 6,
-                    border: `1px solid ${isActive ? "#1e90ff" : "#ddd"}`,
-                    background: isActive ? "rgba(30,144,255,0.08)" : isDone ? "rgba(46,125,50,0.06)" : "#fafafa",
-                    color,
-                    fontSize: 13,
-                  }}
-                >
-                  {idx + 1}. {step}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+            <label style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 13,
+              cursor: "pointer",
+              padding: "6px 12px",
+              background: "#f5f5f5",
+              borderRadius: 6,
+              transition: "all 0.2s"
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = "#ebebeb"}
+            onMouseLeave={(e) => e.currentTarget.style.background = "#f5f5f5"}
+            >
+              <input
+                type="checkbox"
+                checked={useOmniparser}
+                onChange={(e) => setUseOmniparser(e.target.checked)}
+                disabled={extractionLoading}
+                style={{ cursor: "pointer" }}
+              />
+              <span>Use Annotation</span>
+            </label>
 
-      <div style={{ display: "grid", gap: 12, maxWidth: 1200 }}>
-        <div style={{ fontWeight: 600 }}>Debug</div>
-        <div style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 1fr 1fr" }}>
-          <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
-            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Task Spec</div>
-            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
-              {taskSpec ? JSON.stringify(taskSpec, null, 2) : "(empty)"}
-            </pre>
-            <div style={{ fontWeight: 600, fontSize: 12, margin: "8px 0 6px" }}>Task Spec Debug</div>
-            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
-              {taskSpecDebug ? JSON.stringify(taskSpecDebug, null, 2) : "(empty)"}
-            </pre>
+            <label style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 13,
+              cursor: "pointer",
+              padding: "6px 12px",
+              background: "#f5f5f5",
+              borderRadius: 6,
+              transition: "all 0.2s"
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = "#ebebeb"}
+            onMouseLeave={(e) => e.currentTarget.style.background = "#f5f5f5"}
+            >
+              <input
+                type="checkbox"
+                checked={listOnly}
+                onChange={(e) => setListOnly(e.target.checked)}
+                disabled={extractionLoading}
+                style={{ cursor: "pointer" }}
+              />
+              <span>List Only (Fast)</span>
+            </label>
+
+            <button
+              onClick={handleRefreshFiles}
+              disabled={loading}
+              style={{
+                padding: "10px 16px",
+                background: "white",
+                color: "#666",
+                border: "2px solid #e0e0e0",
+                borderRadius: 8,
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: loading ? "not-allowed" : "pointer",
+                transition: "all 0.2s"
+              }}
+            >
+              🔄 Refresh
+            </button>
           </div>
-          <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
-            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Plan Steps</div>
-            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
-              {planDebug ? JSON.stringify(planDebug, null, 2) : "(empty)"}
-            </pre>
+
+          {/* Status Bar */}
+          <div style={{
+            marginTop: 16,
+            padding: 12,
+            background: status.includes("error") ? "#ffebee" : "#e8f5e9",
+            borderRadius: 8,
+            borderLeft: `4px solid ${status.includes("error") ? "#f44336" : "#4caf50"}`,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            <span style={{ fontSize: 13, fontWeight: 500, color: "#333" }}>
+              {status || "Ready to start"}
+            </span>
           </div>
-          <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
-            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Step Decide</div>
-            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
-              {stepDebug ? JSON.stringify(stepDebug, null, 2) : "(empty)"}
-            </pre>
-            <div style={{ marginTop: 6, fontSize: 11, color: "#555" }}>
-              Point: {"target_point" in (stepDebug || {}) ? JSON.stringify((stepDebug as any).target_point) : "(none)"}
+
+          {currentUrl && (
+            <div style={{
+              marginTop: 12,
+              padding: 10,
+              background: "#f5f7ff",
+              borderRadius: 8,
+              fontSize: 12,
+              color: "#666",
+              display: "flex",
+              alignItems: "center",
+              gap: 8
+            }}>
+              <span style={{ fontWeight: 600 }}>🌐 URL:</span>
+              <span style={{
+                flex: 1,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap"
+              }}>
+                {currentUrl}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Steps Card */}
+        {planSteps.length > 0 && (
+          <div style={{
+            background: "rgba(255, 255, 255, 0.95)",
+            backdropFilter: "blur(10px)",
+            borderRadius: 16,
+            padding: 24,
+            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+            animation: "fadeIn 0.5s ease-out 0.2s backwards"
+          }}>
+            <div style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              marginBottom: 16
+            }}>
+              <span style={{ fontSize: 18, fontWeight: 700, color: "#333" }}>📋 Execution Steps</span>
+              <span style={{
+                padding: "4px 12px",
+                background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                color: "white",
+                borderRadius: 12,
+                fontSize: 12,
+                fontWeight: 600
+              }}>
+                {currentStepIndex + 1} / {planSteps.length}
+              </span>
+            </div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {planSteps.map((step, idx) => {
+                const isActive = idx === currentStepIndex;
+                const isDone = idx < currentStepIndex;
+                return (
+                  <div
+                    key={`${idx}-${step}`}
+                    style={{
+                      padding: "14px 16px",
+                      borderRadius: 10,
+                      border: `2px solid ${isActive ? "#667eea" : isDone ? "#4caf50" : "#e0e0e0"}`,
+                      background: isActive ? "linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%)" : isDone ? "rgba(76, 175, 80, 0.05)" : "white",
+                      fontSize: 14,
+                      transition: "all 0.3s",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      animation: `slideIn 0.3s ease-out ${idx * 0.05}s backwards`
+                    }}
+                  >
+                    <div style={{
+                      width: 28,
+                      height: 28,
+                      borderRadius: "50%",
+                      background: isActive ? "linear-gradient(135deg, #667eea 0%, #764ba2 100%)" : isDone ? "#4caf50" : "#e0e0e0",
+                      color: "white",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontWeight: 700,
+                      fontSize: 13,
+                      flexShrink: 0
+                    }}>
+                      {isDone ? "✓" : idx + 1}
+                    </div>
+                    <span style={{
+                      color: isActive ? "#667eea" : isDone ? "#2e7d32" : "#666",
+                      fontWeight: isActive ? 600 : 500,
+                      flex: 1
+                    }}>
+                      {step}
+                    </span>
+                    {isActive && (
+                      <div style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background: "#667eea",
+                        animation: "pulse 2s ease-in-out infinite"
+                      }} />
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
-          <div style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fafafa" }}>
-            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>Finish Check</div>
-            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
-              {finishDebug ? JSON.stringify(finishDebug, null, 2) : "(empty)"}
-            </pre>
+        )}
+
+        {/* Debug Information */}
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          animation: "fadeIn 0.5s ease-out 0.3s backwards"
+        }}>
+          <div style={{
+            fontSize: 18,
+            fontWeight: 700,
+            color: "#333",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            🔍 Debug Information
+          </div>
+          <div style={{
+            display: "grid",
+            gap: 16,
+            gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))"
+          }}>
+            {/* Task Spec */}
+            <div style={{
+              border: "2px solid #e0e0e0",
+              borderRadius: 12,
+              padding: 16,
+              background: "white",
+              transition: "all 0.2s"
+            }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 12,
+                color: "#667eea",
+                display: "flex",
+                alignItems: "center",
+                gap: 6
+              }}>
+                📄 Task Spec
+              </div>
+              <pre style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                fontSize: 11,
+                color: "#666",
+                maxHeight: 200,
+                overflowY: "auto",
+                padding: 8,
+                background: "#f8f9fa",
+                borderRadius: 6
+              }}>
+                {taskSpec ? JSON.stringify(taskSpec, null, 2) : "(empty)"}
+              </pre>
+              {taskSpecDebug && (
+                <>
+                  <div style={{
+                    fontWeight: 600,
+                    fontSize: 13,
+                    margin: "12px 0 8px",
+                    color: "#666"
+                  }}>
+                    Debug Info
+                  </div>
+                  <pre style={{
+                    margin: 0,
+                    whiteSpace: "pre-wrap",
+                    fontSize: 11,
+                    color: "#666",
+                    maxHeight: 150,
+                    overflowY: "auto",
+                    padding: 8,
+                    background: "#f8f9fa",
+                    borderRadius: 6
+                  }}>
+                    {JSON.stringify(taskSpecDebug, null, 2)}
+                  </pre>
+                </>
+              )}
+            </div>
+
+            {/* Plan Steps Debug */}
+            <div style={{
+              border: "2px solid #e0e0e0",
+              borderRadius: 12,
+              padding: 16,
+              background: "white",
+              transition: "all 0.2s"
+            }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 12,
+                color: "#667eea",
+                display: "flex",
+                alignItems: "center",
+                gap: 6
+              }}>
+                🗺️ Plan Steps
+              </div>
+              <pre style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                fontSize: 11,
+                color: "#666",
+                maxHeight: 200,
+                overflowY: "auto",
+                padding: 8,
+                background: "#f8f9fa",
+                borderRadius: 6
+              }}>
+                {planDebug ? JSON.stringify(planDebug, null, 2) : "(empty)"}
+              </pre>
+            </div>
+
+            {/* Step Decision */}
+            <div style={{
+              border: "2px solid #e0e0e0",
+              borderRadius: 12,
+              padding: 16,
+              background: "white",
+              transition: "all 0.2s"
+            }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 12,
+                color: "#667eea",
+                display: "flex",
+                alignItems: "center",
+                gap: 6
+              }}>
+                🎯 Step Decision
+              </div>
+              <pre style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                fontSize: 11,
+                color: "#666",
+                maxHeight: 200,
+                overflowY: "auto",
+                padding: 8,
+                background: "#f8f9fa",
+                borderRadius: 6
+              }}>
+                {stepDebug ? JSON.stringify(stepDebug, null, 2) : "(empty)"}
+              </pre>
+              {stepDebug && "target_point" in stepDebug && (
+                <div style={{
+                  marginTop: 8,
+                  fontSize: 11,
+                  color: "#666",
+                  padding: 8,
+                  background: "#fff3e0",
+                  borderRadius: 6,
+                  borderLeft: "3px solid #ff9800"
+                }}>
+                  <strong>Target Point:</strong> {JSON.stringify((stepDebug as any).target_point)}
+                </div>
+              )}
+            </div>
+
+            {/* Finish Check */}
+            <div style={{
+              border: "2px solid #e0e0e0",
+              borderRadius: 12,
+              padding: 16,
+              background: "white",
+              transition: "all 0.2s"
+            }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 12,
+                color: "#667eea",
+                display: "flex",
+                alignItems: "center",
+                gap: 6
+              }}>
+                ✅ Finish Check
+              </div>
+              <pre style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                fontSize: 11,
+                color: "#666",
+                maxHeight: 200,
+                overflowY: "auto",
+                padding: 8,
+                background: "#f8f9fa",
+                borderRadius: 6
+              }}>
+                {finishDebug ? JSON.stringify(finishDebug, null, 2) : "(empty)"}
+              </pre>
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* VLM 对话详情 (v2.2) */}
+      {/* VLM Conversation Details */}
       {vlmConversation && (
-        <div style={{ display: "grid", gap: 12, maxWidth: 1200, border: "2px solid #1e90ff", borderRadius: 8, padding: 16, background: "#f0f8ff" }}>
-          <div style={{ fontWeight: 600, fontSize: 18, color: "#1e90ff" }}>🔍 VLM 对话详情 (Debug)</div>
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          border: "3px solid #667eea",
+          animation: "fadeIn 0.5s ease-out"
+        }}>
+          <div style={{
+            fontSize: 20,
+            fontWeight: 700,
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+            marginBottom: 20,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            🔍 VLM Conversation Details
+          </div>
 
-          {/* 标注图片 - VLM 看到的 */}
-          <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>标注图片（VLM 看到的）</div>
-            <div style={{ border: "1px solid #ddd", borderRadius: 6, overflow: "hidden", background: "#fff" }}>
+          {/* Annotated Image */}
+          <div style={{ marginBottom: 20 }}>
+            <div style={{
+              fontWeight: 600,
+              fontSize: 15,
+              marginBottom: 12,
+              color: "#333"
+            }}>
+              📸 Annotated Image (VLM View)
+            </div>
+            <div style={{
+              border: "2px solid #e0e0e0",
+              borderRadius: 12,
+              overflow: "hidden",
+              background: "white",
+              boxShadow: "0 4px 12px rgba(0, 0, 0, 0.08)"
+            }}>
               <img
                 src={`data:image/png;base64,${vlmConversation.request.annotated_image}`}
                 alt="VLM Annotated View"
-                style={{ width: "100%", maxWidth: 800, display: "block" }}
+                style={{ width: "100%", maxWidth: 900, display: "block" }}
               />
             </div>
           </div>
 
-          {/* 请求信息 */}
-          <div style={{ display: "grid", gap: 8, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fff" }}>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>📤 VLM 请求信息</div>
-            <div style={{ display: "grid", gap: 4, fontSize: 13 }}>
-              <div><strong>任务:</strong> {vlmConversation.request.task}</div>
-              <div><strong>元素数量:</strong> {vlmConversation.request.elements_count}</div>
-              <div><strong>图片尺寸:</strong> {vlmConversation.request.image_size[0]} × {vlmConversation.request.image_size[1]}</div>
+          {/* Request Information */}
+          <div style={{
+            border: "2px solid #e0e0e0",
+            borderRadius: 12,
+            padding: 20,
+            background: "white",
+            marginBottom: 16
+          }}>
+            <div style={{
+              fontWeight: 600,
+              fontSize: 15,
+              marginBottom: 12,
+              color: "#667eea",
+              display: "flex",
+              alignItems: "center",
+              gap: 6
+            }}>
+              📤 VLM Request
+            </div>
+            <div style={{ display: "grid", gap: 10, fontSize: 14 }}>
+              <div style={{
+                padding: 10,
+                background: "#f8f9fa",
+                borderRadius: 8,
+                borderLeft: "3px solid #667eea"
+              }}>
+                <strong>Task:</strong> {vlmConversation.request.task}
+              </div>
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                <div style={{
+                  padding: "8px 16px",
+                  background: "#e3f2fd",
+                  borderRadius: 8,
+                  fontSize: 13
+                }}>
+                  <strong>Elements:</strong> {vlmConversation.request.elements_count}
+                </div>
+                <div style={{
+                  padding: "8px 16px",
+                  background: "#f3e5f5",
+                  borderRadius: 8,
+                  fontSize: 13
+                }}>
+                  <strong>Image Size:</strong> {vlmConversation.request.image_size[0]} × {vlmConversation.request.image_size[1]}
+                </div>
+              </div>
             </div>
 
-            <div style={{ marginTop: 8 }}>
-              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6 }}>元素列表（前20个）:</div>
-              <div style={{ maxHeight: 200, overflowY: "auto", border: "1px solid #eee", borderRadius: 4 }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                  <thead style={{ position: "sticky", top: 0, background: "#f5f5f5", borderBottom: "1px solid #ddd" }}>
+            <div style={{ marginTop: 16 }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 10,
+                color: "#333"
+              }}>
+                Element List (First 20):
+              </div>
+              <div style={{
+                maxHeight: 250,
+                overflowY: "auto",
+                border: "2px solid #e0e0e0",
+                borderRadius: 8,
+                background: "white"
+              }}>
+                <table style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: 13
+                }}>
+                  <thead style={{
+                    position: "sticky",
+                    top: 0,
+                    background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                    color: "white"
+                  }}>
                     <tr>
-                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>ID</th>
-                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>类型</th>
-                      <th style={{ padding: "6px 8px", textAlign: "left", fontWeight: 600 }}>内容</th>
+                      <th style={{
+                        padding: "10px 12px",
+                        textAlign: "left",
+                        fontWeight: 600
+                      }}>ID</th>
+                      <th style={{
+                        padding: "10px 12px",
+                        textAlign: "left",
+                        fontWeight: 600
+                      }}>Type</th>
+                      <th style={{
+                        padding: "10px 12px",
+                        textAlign: "left",
+                        fontWeight: 600
+                      }}>Content</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {vlmConversation.request.elements.map((elem) => (
-                      <tr key={elem.id} style={{ borderBottom: "1px solid #eee" }}>
-                        <td style={{ padding: "6px 8px" }}>{elem.id}</td>
-                        <td style={{ padding: "6px 8px", color: "#666" }}>{elem.type}</td>
-                        <td style={{ padding: "6px 8px", maxWidth: 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {vlmConversation.request.elements.map((elem, idx) => (
+                      <tr
+                        key={elem.id}
+                        style={{
+                          borderBottom: "1px solid #e0e0e0",
+                          background: idx % 2 === 0 ? "#fafafa" : "white"
+                        }}
+                      >
+                        <td style={{
+                          padding: "10px 12px",
+                          fontWeight: 600,
+                          color: "#667eea"
+                        }}>{elem.id}</td>
+                        <td style={{
+                          padding: "10px 12px",
+                          color: "#666"
+                        }}>{elem.type}</td>
+                        <td style={{
+                          padding: "10px 12px",
+                          maxWidth: 500,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap"
+                        }}>
                           {elem.content}
                         </td>
                       </tr>
@@ -515,35 +1082,66 @@ function App() {
             </div>
           </div>
 
-          {/* 响应信息 */}
-          <div style={{ display: "grid", gap: 8, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fff" }}>
-            <div style={{ fontWeight: 600, fontSize: 14 }}>📥 VLM 响应</div>
+          {/* Response Information */}
+          <div style={{
+            border: "2px solid #e0e0e0",
+            borderRadius: 12,
+            padding: 20,
+            background: "white"
+          }}>
+            <div style={{
+              fontWeight: 600,
+              fontSize: 15,
+              marginBottom: 12,
+              color: "#667eea",
+              display: "flex",
+              alignItems: "center",
+              gap: 6
+            }}>
+              📥 VLM Response
+            </div>
             <div>
-              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>解析后的 JSON:</div>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 8,
+                color: "#333"
+              }}>
+                Parsed JSON:
+              </div>
               <pre style={{
                 margin: 0,
-                padding: 10,
-                background: "#f5f5f5",
-                borderRadius: 4,
+                padding: 16,
+                background: "#f8f9fa",
+                borderRadius: 8,
                 fontSize: 12,
                 overflowX: "auto",
-                border: "1px solid #ddd"
+                border: "2px solid #e0e0e0",
+                maxHeight: 300
               }}>
                 {JSON.stringify(vlmConversation.response, null, 2)}
               </pre>
             </div>
 
-            <div style={{ marginTop: 8 }}>
-              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>原始响应文本:</div>
+            <div style={{ marginTop: 16 }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 14,
+                marginBottom: 8,
+                color: "#333"
+              }}>
+                Raw Response:
+              </div>
               <pre style={{
                 margin: 0,
-                padding: 10,
-                background: "#f5f5f5",
-                borderRadius: 4,
+                padding: 16,
+                background: "#f8f9fa",
+                borderRadius: 8,
                 fontSize: 12,
                 overflowX: "auto",
-                border: "1px solid #ddd",
-                whiteSpace: "pre-wrap"
+                border: "2px solid #e0e0e0",
+                whiteSpace: "pre-wrap",
+                maxHeight: 300
               }}>
                 {vlmConversation.response_raw}
               </pre>
@@ -552,39 +1150,184 @@ function App() {
         </div>
       )}
 
-      <div style={{ display: "grid", gap: 6, maxWidth: 1200 }}>
-        <div style={{ fontWeight: 600 }}>Outputs</div>
-        {files.length === 0 ? (
-          <div style={{ fontSize: 12, color: "#666" }}>No output files yet.</div>
-        ) : (
-          <div style={{ display: "grid", gap: 4 }}>
-            {files.map((file) => (
-              <a key={file} href={`${API_BASE}/files/${encodeURIComponent(file)}`} target="_blank" rel="noreferrer">
-                {file}
-              </a>
-            ))}
+        {/* Output Files */}
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          animation: "fadeIn 0.5s ease-out 0.4s backwards"
+        }}>
+          <div style={{
+            fontSize: 18,
+            fontWeight: 700,
+            color: "#333",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            📁 Output Files
+            {files.length > 0 && (
+              <span style={{
+                padding: "4px 12px",
+                background: "#4caf50",
+                color: "white",
+                borderRadius: 12,
+                fontSize: 12,
+                fontWeight: 600
+              }}>
+                {files.length}
+              </span>
+            )}
           </div>
-        )}
-      </div>
+          {files.length === 0 ? (
+            <div style={{
+              padding: 32,
+              textAlign: "center",
+              color: "#999",
+              fontSize: 14,
+              background: "#f8f9fa",
+              borderRadius: 12,
+              border: "2px dashed #e0e0e0"
+            }}>
+              No output files yet. Run extraction to generate files.
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 8 }}>
+              {files.map((file, idx) => (
+                <a
+                  key={file}
+                  href={`${API_BASE}/files/${encodeURIComponent(file)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    padding: "12px 16px",
+                    background: "white",
+                    border: "2px solid #e0e0e0",
+                    borderRadius: 10,
+                    textDecoration: "none",
+                    color: "#667eea",
+                    fontWeight: 500,
+                    fontSize: 14,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    transition: "all 0.2s",
+                    animation: `slideIn 0.3s ease-out ${idx * 0.05}s backwards`
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "#667eea";
+                    e.currentTarget.style.background = "#f5f7ff";
+                    e.currentTarget.style.transform = "translateX(4px)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "#e0e0e0";
+                    e.currentTarget.style.background = "white";
+                    e.currentTarget.style.transform = "translateX(0)";
+                  }}
+                >
+                  <span style={{ fontSize: 18 }}>📄</span>
+                  <span style={{ flex: 1 }}>{file}</span>
+                  <span style={{ fontSize: 12, color: "#999" }}>↗</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
 
-      {/* 实时进度显示 */}
+      {/* Real-time Progress */}
       {extractionLoading && extractionProgress.length > 0 && (
-        <div style={{ display: "grid", gap: 8, maxWidth: 1200, border: "1px solid #1e90ff", borderRadius: 6, padding: 12, background: "#e3f2fd" }}>
-          <div style={{ fontWeight: 600, fontSize: 16 }}>实时进度</div>
-          <div style={{ display: "grid", gap: 4 }}>
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          border: "3px solid #2196f3",
+          animation: "fadeIn 0.5s ease-out"
+        }}>
+          <div style={{
+            fontSize: 18,
+            fontWeight: 700,
+            color: "#2196f3",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            <div style={{
+              width: 20,
+              height: 20,
+              border: "3px solid #2196f3",
+              borderTopColor: "transparent",
+              borderRadius: "50%",
+              animation: "spin 1s linear infinite"
+            }} />
+            Real-time Progress
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
             {extractionProgress.map((prog, idx) => (
-              <div key={idx} style={{ padding: "6px 8px", background: "#fff", border: "1px solid #90caf9", borderRadius: 4, fontSize: 12 }}>
-                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+              <div
+                key={idx}
+                style={{
+                  padding: "14px 16px",
+                  background: "white",
+                  border: "2px solid #90caf9",
+                  borderRadius: 10,
+                  fontSize: 13,
+                  animation: `slideIn 0.3s ease-out ${idx * 0.05}s backwards`
+                }}
+              >
+                <div style={{
+                  fontWeight: 600,
+                  marginBottom: 6,
+                  color: "#1976d2",
+                  fontSize: 14
+                }}>
                   {String(prog.stage)} - {String(prog.status)}
                 </div>
                 {prog.current_action && (
-                  <div style={{ color: "#1565c0", fontSize: 11 }}>
+                  <div style={{
+                    color: "#1565c0",
+                    fontSize: 12,
+                    marginBottom: 4,
+                    padding: "6px 10px",
+                    background: "#e3f2fd",
+                    borderRadius: 6,
+                    borderLeft: "3px solid #2196f3"
+                  }}>
                     {String(prog.current_action)}
                   </div>
                 )}
                 {prog.processed !== undefined && prog.total !== undefined && (
-                  <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>
-                    进度: {String(prog.processed)} / {String(prog.total)}
+                  <div style={{
+                    fontSize: 12,
+                    color: "#666",
+                    marginTop: 8,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8
+                  }}>
+                    <span style={{ fontWeight: 600 }}>Progress:</span>
+                    <div style={{
+                      flex: 1,
+                      height: 8,
+                      background: "#e0e0e0",
+                      borderRadius: 4,
+                      overflow: "hidden"
+                    }}>
+                      <div style={{
+                        height: "100%",
+                        background: "linear-gradient(90deg, #2196f3 0%, #21cbf3 100%)",
+                        width: `${(Number(prog.processed) / Number(prog.total)) * 100}%`,
+                        transition: "width 0.3s"
+                      }} />
+                    </div>
+                    <span style={{ fontWeight: 600, minWidth: 60, textAlign: "right" }}>
+                      {String(prog.processed)} / {String(prog.total)}
+                    </span>
                   </div>
                 )}
               </div>
@@ -593,35 +1336,156 @@ function App() {
         </div>
       )}
 
+      {/* Extraction Results */}
       {extractionResult && (
-        <div style={{ display: "grid", gap: 8, maxWidth: 1200, border: "1px solid #ddd", borderRadius: 6, padding: 12, background: "#fafafa" }}>
-          <div style={{ fontWeight: 600, fontSize: 16 }}>提取结果</div>
-          <div style={{ display: "grid", gap: 6, fontSize: 13 }}>
-            <div>状态: <span style={{ color: extractionResult.status === 'success' ? '#2e7d32' : extractionResult.status === 'partial' ? '#f57c00' : '#d32f2f', fontWeight: 600 }}>{extractionResult.status}</span></div>
-            <div>已提取: {extractionResult.items_extracted} / {extractionResult.target_count} 条</div>
-            {extractionResult.file_path && (
-              <div>
-                文件: <a href={`${API_BASE}/files/${encodeURIComponent(extractionResult.file_path)}`} target="_blank" rel="noreferrer" style={{ color: "#1e90ff" }}>
-                  {extractionResult.file_path}
-                </a>
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          border: `3px solid ${extractionResult.status === 'success' ? '#4caf50' : extractionResult.status === 'partial' ? '#ff9800' : '#f44336'}`,
+          animation: "fadeIn 0.5s ease-out"
+        }}>
+          <div style={{
+            fontSize: 18,
+            fontWeight: 700,
+            color: extractionResult.status === 'success' ? '#4caf50' : extractionResult.status === 'partial' ? '#ff9800' : '#f44336',
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            {extractionResult.status === 'success' ? '✅' : extractionResult.status === 'partial' ? '⚠️' : '❌'}
+            Extraction Results
+          </div>
+
+          <div style={{
+            display: "grid",
+            gap: 12,
+            marginBottom: 20
+          }}>
+            <div style={{
+              display: "flex",
+              gap: 16,
+              flexWrap: "wrap"
+            }}>
+              <div style={{
+                padding: "12px 20px",
+                background: extractionResult.status === 'success' ? '#e8f5e9' : extractionResult.status === 'partial' ? '#fff3e0' : '#ffebee',
+                borderRadius: 10,
+                borderLeft: `4px solid ${extractionResult.status === 'success' ? '#4caf50' : extractionResult.status === 'partial' ? '#ff9800' : '#f44336'}`
+              }}>
+                <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>Status</div>
+                <div style={{
+                  fontSize: 16,
+                  fontWeight: 700,
+                  color: extractionResult.status === 'success' ? '#2e7d32' : extractionResult.status === 'partial' ? '#f57c00' : '#d32f2f',
+                  textTransform: "uppercase"
+                }}>
+                  {extractionResult.status}
+                </div>
               </div>
-            )}
+
+              <div style={{
+                padding: "12px 20px",
+                background: "#e3f2fd",
+                borderRadius: 10,
+                borderLeft: "4px solid #2196f3"
+              }}>
+                <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>Items Extracted</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: "#1976d2" }}>
+                  {extractionResult.items_extracted} / {extractionResult.target_count}
+                </div>
+              </div>
+
+              {extractionResult.file_path && (
+                <div style={{
+                  padding: "12px 20px",
+                  background: "#f3e5f5",
+                  borderRadius: 10,
+                  borderLeft: "4px solid #9c27b0",
+                  flex: 1,
+                  minWidth: 200
+                }}>
+                  <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>Output File</div>
+                  <a
+                    href={`${API_BASE}/files/${encodeURIComponent(extractionResult.file_path)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      color: "#7b1fa2",
+                      fontWeight: 600,
+                      fontSize: 14,
+                      textDecoration: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6
+                    }}
+                  >
+                    {extractionResult.file_path}
+                    <span style={{ fontSize: 12 }}>↗</span>
+                  </a>
+                </div>
+              )}
+            </div>
+
             {extractionResult.errors.length > 0 && (
-              <div style={{ color: "#d32f2f" }}>
-                错误: {extractionResult.errors.join("; ")}
+              <div style={{
+                padding: "12px 16px",
+                background: "#ffebee",
+                borderRadius: 10,
+                borderLeft: "4px solid #f44336",
+                color: "#c62828",
+                fontSize: 13
+              }}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>⚠️ Errors:</div>
+                {extractionResult.errors.join("; ")}
               </div>
             )}
           </div>
 
+          {/* Data Preview */}
           {extractionResult.items.length > 0 && (
-            <div style={{ marginTop: 8 }}>
-              <div style={{ fontWeight: 600, marginBottom: 6 }}>数据预览</div>
-              <div style={{ overflowX: "auto", maxHeight: 400, border: "1px solid #ddd", borderRadius: 4 }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                  <thead>
-                    <tr style={{ background: "#f5f5f5", borderBottom: "2px solid #ddd" }}>
+            <div>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 15,
+                marginBottom: 12,
+                color: "#333"
+              }}>
+                📊 Data Preview
+              </div>
+              <div style={{
+                overflowX: "auto",
+                maxHeight: 450,
+                border: "2px solid #e0e0e0",
+                borderRadius: 12,
+                background: "white"
+              }}>
+                <table style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: 13
+                }}>
+                  <thead style={{
+                    position: "sticky",
+                    top: 0,
+                    background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                    color: "white",
+                    zIndex: 1
+                  }}>
+                    <tr>
                       {Object.keys(extractionResult.items[0]).map((key) => (
-                        <th key={key} style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600 }}>
+                        <th
+                          key={key}
+                          style={{
+                            padding: "12px 16px",
+                            textAlign: "left",
+                            fontWeight: 600,
+                            whiteSpace: "nowrap"
+                          }}
+                        >
                           {key}
                         </th>
                       ))}
@@ -629,9 +1493,27 @@ function App() {
                   </thead>
                   <tbody>
                     {extractionResult.items.map((item, idx) => (
-                      <tr key={idx} style={{ borderBottom: "1px solid #eee" }}>
+                      <tr
+                        key={idx}
+                        style={{
+                          borderBottom: "1px solid #e0e0e0",
+                          background: idx % 2 === 0 ? "#fafafa" : "white",
+                          transition: "background 0.2s"
+                        }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = "#f5f7ff"}
+                        onMouseLeave={(e) => e.currentTarget.style.background = idx % 2 === 0 ? "#fafafa" : "white"}
+                      >
                         {Object.values(item).map((value, vidx) => (
-                          <td key={vidx} style={{ padding: "8px 12px", maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <td
+                            key={vidx}
+                            style={{
+                              padding: "12px 16px",
+                              maxWidth: 350,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap"
+                            }}
+                          >
                             {String(value)}
                           </td>
                         ))}
@@ -643,14 +1525,55 @@ function App() {
             </div>
           )}
 
+          {/* Execution Progress */}
           {extractionResult.progress.length > 0 && (
-            <div style={{ marginTop: 8 }}>
-              <div style={{ fontWeight: 600, marginBottom: 6 }}>执行进度</div>
-              <div style={{ display: "grid", gap: 4 }}>
+            <div style={{ marginTop: 20 }}>
+              <div style={{
+                fontWeight: 600,
+                fontSize: 15,
+                marginBottom: 12,
+                color: "#333"
+              }}>
+                ⏱️ Execution Timeline
+              </div>
+              <div style={{ display: "grid", gap: 8 }}>
                 {extractionResult.progress.map((prog, idx) => (
-                  <div key={idx} style={{ padding: "6px 8px", background: "#fff", border: "1px solid #ddd", borderRadius: 4, fontSize: 12 }}>
-                    <span style={{ fontWeight: 600 }}>{String(prog.stage)}</span>: {String(prog.status)}
-                    {prog.items !== undefined && ` (${prog.items} items)`}
+                  <div
+                    key={idx}
+                    style={{
+                      padding: "12px 16px",
+                      background: "white",
+                      border: "2px solid #e0e0e0",
+                      borderRadius: 10,
+                      fontSize: 13,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      animation: `slideIn 0.3s ease-out ${idx * 0.05}s backwards`
+                    }}
+                  >
+                    <div style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background: "#4caf50",
+                      flexShrink: 0
+                    }} />
+                    <span style={{ fontWeight: 600, color: "#333" }}>{String(prog.stage)}:</span>
+                    <span style={{ color: "#666" }}>{String(prog.status)}</span>
+                    {prog.items !== undefined && (
+                      <span style={{
+                        marginLeft: "auto",
+                        padding: "4px 10px",
+                        background: "#e8f5e9",
+                        borderRadius: 6,
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: "#2e7d32"
+                      }}>
+                        {prog.items} items
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -659,75 +1582,119 @@ function App() {
         </div>
       )}
 
-      <div
-        style={{
-          position: "relative",
-          border: "1px solid #ccc",
-          width: "100%",
-          maxWidth: 1200,
-          cursor: "crosshair",
-        }}
-        onClick={handleManualClick}
-        onMouseMove={handleMouseMove}
-      >
-        {imgSrc ? (
-          <img ref={imgRef} src={imgSrc} alt="annotated" style={{ width: "100%" }} />
-        ) : (
-          <div style={{ padding: 24 }}>No image yet. Click Run.</div>
-        )}
+        {/* Screenshot Viewer */}
+        <div style={{
+          background: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(10px)",
+          borderRadius: 16,
+          padding: 24,
+          boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
+          animation: "fadeIn 0.5s ease-out 0.5s backwards"
+        }}>
+          <div style={{
+            fontSize: 18,
+            fontWeight: 700,
+            color: "#333",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            gap: 8
+          }}>
+            🖼️ Screenshot Viewer
+          </div>
+          <div
+            style={{
+              position: "relative",
+              border: "3px solid #e0e0e0",
+              borderRadius: 12,
+              overflow: "hidden",
+              cursor: imgSrc ? "crosshair" : "default",
+              background: imgSrc ? "white" : "#f8f9fa",
+              transition: "all 0.2s"
+            }}
+            onClick={handleManualClick}
+            onMouseMove={handleMouseMove}
+          >
+            {imgSrc ? (
+              <img
+                ref={imgRef}
+                src={imgSrc}
+                alt="annotated"
+                style={{
+                  width: "100%",
+                  display: "block"
+                }}
+              />
+            ) : (
+              <div style={{
+                padding: 64,
+                textAlign: "center",
+                color: "#999",
+                fontSize: 15
+              }}>
+                <div style={{ fontSize: 48, marginBottom: 16 }}>📸</div>
+                <div>No screenshot yet. Click Run to start.</div>
+              </div>
+            )}
 
-        {imgRef.current && elements.map((elem) => {
-          const [x, y, w, h] = elem.bbox;
-          const scaleX = imgRef.current.width / imgRef.current.naturalWidth;
-          const scaleY = imgRef.current.height / imgRef.current.naturalHeight;
-          const left = x * scaleX;
-          const top = y * scaleY;
-          const width = w * scaleX;
-          const height = h * scaleY;
-          const isHover = hoverId === elem.id;
-          const isSelected = selectedId === elem.id;
-          return (
-            <div
-              key={elem.id}
-              style={{
-                position: "absolute",
-                left,
-                top,
-                width,
-                height,
-                border: isSelected ? "2px solid #ff6b00" : isHover ? "2px solid #1e90ff" : "1px solid #00c853",
-                pointerEvents: "none",
-                boxSizing: "border-box",
-                background: isSelected ? "rgba(255,107,0,0.15)" : "transparent",
-              }}
-              title={`${elem.id}: ${elem.content}`}
-            />
-          );
-        })}
-        {imgRef.current && lastTargetPoint && (() => {
-          const [x, y] = lastTargetPoint;
-          const scaleX = imgRef.current.width / imgRef.current.naturalWidth;
-          const scaleY = imgRef.current.height / imgRef.current.naturalHeight;
-          const left = x * scaleX;
-          const top = y * scaleY;
-          return (
-            <div
-              style={{
-                position: "absolute",
-                left: left - 4,
-                top: top - 4,
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                background: "#ff3b30",
-                border: "1px solid #fff",
-                boxShadow: "0 0 4px rgba(0,0,0,0.4)",
-                pointerEvents: "none",
-              }}
-              title={`target_point: ${x}, ${y}`}
-            />
-          );
-        })()}
+            {imgRef.current && elements.map((elem) => {
+              const [x, y, w, h] = elem.bbox;
+              const scaleX = imgRef.current!.width / imgRef.current!.naturalWidth;
+              const scaleY = imgRef.current!.height / imgRef.current!.naturalHeight;
+              const left = x * scaleX;
+              const top = y * scaleY;
+              const width = w * scaleX;
+              const height = h * scaleY;
+              const isHover = hoverId === elem.id;
+              const isSelected = selectedId === elem.id;
+              return (
+                <div
+                  key={elem.id}
+                  style={{
+                    position: "absolute",
+                    left,
+                    top,
+                    width,
+                    height,
+                    border: isSelected ? "3px solid #ff6b00" : isHover ? "3px solid #667eea" : "2px solid #4caf50",
+                    pointerEvents: "none",
+                    boxSizing: "border-box",
+                    background: isSelected ? "rgba(255,107,0,0.2)" : isHover ? "rgba(102,126,234,0.15)" : "transparent",
+                    transition: "all 0.2s",
+                    borderRadius: 4
+                  }}
+                  title={`${elem.id}: ${elem.content}`}
+                />
+              );
+            })}
+            {imgRef.current && lastTargetPoint && (() => {
+              const [x, y] = lastTargetPoint;
+              const scaleX = imgRef.current!.width / imgRef.current!.naturalWidth;
+              const scaleY = imgRef.current!.height / imgRef.current!.naturalHeight;
+              const left = x * scaleX;
+              const top = y * scaleY;
+              return (
+                <div
+                  key="target-point"
+                  style={{
+                    position: "absolute",
+                    left: left - 6,
+                    top: top - 6,
+                    width: 12,
+                    height: 12,
+                    borderRadius: "50%",
+                    background: "#ff3b30",
+                    border: "2px solid #fff",
+                    boxShadow: "0 0 8px rgba(255,59,48,0.6), 0 0 0 4px rgba(255,59,48,0.2)",
+                    pointerEvents: "none",
+                    animation: "pulse 2s ease-in-out infinite"
+                  }}
+                  title={`target_point: ${x}, ${y}`}
+                />
+              );
+            })()}
+          </div>
+        </div>
       </div>
     </div>
   );
