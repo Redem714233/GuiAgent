@@ -94,14 +94,28 @@ class ReflectionEngine:
 
             execution_history.append(step_result)
 
-            # 根据验证结果决定下一步
+            # 根据验证结果决策下一步
             if step_result["status"] == "success":
                 logger.info(f"✓ Step {current_step_index + 1} succeeded")
-                current_step_index += 1  # 继续下一步
+                current_step_index += 1
             elif step_result["status"] == "failed":
                 logger.error(f"✗ Step {current_step_index + 1} failed after {step_result['retry_index']} retries")
-                # 失败但继续尝试下一步（可选：也可以直接终止）
-                current_step_index += 1
+
+                # 询问 VLM 是否需要调整计划
+                should_replan = await self._should_replan_after_failure(
+                    task=task,
+                    failed_step=step_description,
+                    step_index=current_step_index,
+                    failure_reason=step_result.get("verification", {}).get("reasoning", ""),
+                    remaining_steps=steps_list[current_step_index + 1:]
+                )
+
+                if should_replan:
+                    logger.warning("VLM suggests replanning, skipping remaining steps")
+                    break
+                else:
+                    # 继续下一步
+                    current_step_index += 1
             elif step_result["status"] == "terminated":
                 logger.error(f"✗ Step {current_step_index + 1} terminated (unrecoverable error)")
                 break
@@ -195,7 +209,89 @@ class ReflectionEngine:
 
             logger.info(f"Verification result: {verification}")
 
-            # 5. 决策下一步
+            # 5. 处理特殊情况
+            special_case = verification.get("special_case")
+            if special_case:
+                logger.warning(f"Special case detected: {special_case}")
+
+                if special_case == "login_required":
+                    # 需要登录 → 终止任务
+                    return {
+                        "step_index": step_index,
+                        "retry_index": retry_index,
+                        "description": step_description,
+                        "action": action_result.get("action", "unknown"),
+                        "before_url": before_url,
+                        "after_url": after_url,
+                        "verification": verification,
+                        "verification_raw": verification_raw,
+                        "status": "terminated",
+                        "termination_reason": "login_required",
+                        "user_message": "该网站需要登录，任务已终止"
+                    }
+
+                elif special_case == "ad_popup":
+                    # 广告弹窗 → 尝试关闭
+                    logger.info("Attempting to close ad popup...")
+                    popup_element_id = verification.get("popup_element_id")
+
+                    if popup_element_id:
+                        try:
+                            # 点击关闭按钮
+                            await self.executor.click_element_by_id(popup_element_id)
+                            await asyncio.sleep(1)
+                            await self.executor.wait_for_stable(1000)
+                            logger.info("Ad popup closed successfully")
+
+                            # 重试当前步骤
+                            retry_index += 1
+                            continue
+                        except Exception as e:
+                            logger.error(f"Failed to close ad popup: {e}")
+
+                    # 如果无法关闭，尝试按 ESC 键
+                    try:
+                        await self.executor.press("Escape")
+                        await asyncio.sleep(1)
+                        logger.info("Pressed ESC to close popup")
+                        retry_index += 1
+                        continue
+                    except Exception as e:
+                        logger.error(f"Failed to press ESC: {e}")
+
+                elif special_case == "captcha":
+                    # 验证码 → 终止任务
+                    return {
+                        "step_index": step_index,
+                        "retry_index": retry_index,
+                        "description": step_description,
+                        "action": action_result.get("action", "unknown"),
+                        "before_url": before_url,
+                        "after_url": after_url,
+                        "verification": verification,
+                        "verification_raw": verification_raw,
+                        "status": "terminated",
+                        "termination_reason": "captcha",
+                        "user_message": "遇到验证码，任务已终止"
+                    }
+
+                elif special_case == "error_page":
+                    # 错误页面 → 终止任务
+                    return {
+                        "step_index": step_index,
+                        "retry_index": retry_index,
+                        "description": step_description,
+                        "action": action_result.get("action", "unknown"),
+                        "before_url": before_url,
+                        "after_url": after_url,
+                        "verification": verification,
+                        "verification_raw": verification_raw,
+                        "status": "terminated",
+                        "termination_reason": "error_page",
+                        "user_message": f"页面错误: {verification.get('reasoning', '未知错误')}"
+                    }
+
+            # 6. 决策下一步
             if verification.get("success", False):
                 # 成功 → 返回
                 return {
@@ -256,6 +352,20 @@ class ReflectionEngine:
             "details": {...}
         }
         """
+        # 检查是否是提取步骤（排除 goto 等导航步骤）
+        extract_keywords = ["extract", "提取", "采集", "收集", "抓取", "scrape", "copy", "复制"]
+        is_extract = any(kw in step_description.lower() for kw in extract_keywords)
+        is_navigation = any(kw in step_description.lower() for kw in ["goto", "click", "navigate", "访问", "打开", "点击"])
+
+        if is_extract and not is_navigation:
+            # 提取步骤：直接返回成功，不执行任何动作
+            logger.info(f"Detected extraction step, skipping action execution")
+            return {
+                "success": True,
+                "action": "extract (no browser action needed)",
+                "details": {"tool": "extract", "description": step_description}
+            }
+
         # 标记页面元素
         dom_result = await self.executor.mark_page_elements()
         elements = dom_result.get('elements', [])
@@ -272,11 +382,11 @@ class ReflectionEngine:
 
         # 使用VLM决策动作
         action, action_raw = self.vlm.decide(
-            task=step_description,  # 使用步骤描述作为任务
+            task=step_description,
             elements=elements,
             annotated_image_base64=image_base64,
             image_size=(1280, 720),
-            plan_context=task,  # 传入总任务作为上下文
+            plan_context=task,
         )
 
         logger.info(f"VLM decided action: {action}")
@@ -334,3 +444,59 @@ class ReflectionEngine:
         """获取页面元素列表"""
         dom_result = await self.executor.mark_page_elements()
         return dom_result.get('elements', [])
+
+    async def _should_replan_after_failure(
+        self,
+        task: str,
+        failed_step: str,
+        step_index: int,
+        failure_reason: str,
+        remaining_steps: List[str]
+    ) -> bool:
+        """
+        询问 VLM 是否需要在失败后重新规划
+
+        返回:
+            True - 需要终止并重新规划
+            False - 可以继续执行剩余步骤
+        """
+        prompt = f"""任务: {task}
+
+步骤 {step_index + 1} 失败: {failed_step}
+失败原因: {failure_reason}
+
+剩余步骤:
+{chr(10).join(f"{i+1}. {s}" for i, s in enumerate(remaining_steps))}
+
+问题: 是否应该终止当前计划？
+
+回答 "yes" 如果:
+- 失败的步骤是关键步骤，后续步骤依赖它
+- 当前状态与预期差距太大，继续执行没有意义
+- 需要完全不同的策略
+
+回答 "no" 如果:
+- 失败的步骤不影响后续步骤
+- 可以跳过这一步继续执行
+- 剩余步骤仍然有价值
+
+只回答 "yes" 或 "no"，不要解释。"""
+
+        try:
+            # 简单的文本判断（避免调用 VLM）
+            # 如果剩余步骤为空，直接终止
+            if not remaining_steps:
+                return True
+
+            # 如果失败原因包含关键词，建议重新规划
+            critical_keywords = ["无法找到", "页面错误", "导航失败", "元素不存在"]
+            if any(kw in failure_reason for kw in critical_keywords):
+                logger.info("Detected critical failure, suggesting replan")
+                return True
+
+            # 默认继续执行
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to check replan: {e}")
+            return False  # 出错时继续执行

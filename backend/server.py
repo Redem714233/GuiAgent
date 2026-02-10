@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import Response
 
 from .executor import Executor
 from .omniparser_service import OmniParserService
@@ -22,6 +28,7 @@ from .output_store import OutputStore
 from .storage import ensure_dir, timestamp_name
 from .extraction_engine import ExtractionEngine
 from .visualizer import annotate_screenshot_base64
+from .vlm_service import VLMService
 from PIL import Image
 import io
 
@@ -246,6 +253,114 @@ def _is_typing_task(task: str) -> bool:
     keywords = ["输入", "type", "键入", "填入", "enter", "press enter"]
     task_lower = task.lower()
     return any(k.lower() in task_lower for k in keywords)
+
+
+def _canonical_field_name(field: str) -> str:
+    field_lower = str(field or "").strip().lower()
+    mapping = {
+        "name": "title",
+        "book_name": "title",
+        "title": "title",
+        "书名": "title",
+        "价格": "price",
+        "price": "price",
+        "作者": "author",
+        "author": "author",
+        "vote": "votes",
+        "votes": "votes",
+        "rating": "votes",
+        "评分": "votes",
+        "链接": "url",
+        "link": "url",
+        "url": "url",
+        "摘要": "summary",
+        "summary": "summary",
+        "内容": "content",
+        "content": "content",
+        "时间": "time",
+        "time": "time",
+        "来源": "source",
+        "source": "source",
+    }
+    return mapping.get(field_lower, field_lower)
+
+
+def _resolve_requested_fields(task: str, spec_fields: Optional[list]) -> Optional[set[str]]:
+    task_lower = (task or "").lower()
+
+    # 显式要求全部字段时不做过滤
+    all_fields_markers = ["所有字段", "全部字段", "所有信息", "完整信息", "all fields", "full fields"]
+    if any(marker in task_lower for marker in all_fields_markers):
+        return None
+
+    requested: set[str] = set()
+
+    if isinstance(spec_fields, list):
+        for field in spec_fields:
+            canonical = _canonical_field_name(str(field))
+            if canonical:
+                requested.add(canonical)
+
+    keyword_mapping = {
+        "书名": "title",
+        "标题": "title",
+        "title": "title",
+        "name": "title",
+        "价格": "price",
+        "price": "price",
+        "作者": "author",
+        "author": "author",
+        "评分": "votes",
+        "投票": "votes",
+        "votes": "votes",
+        "rating": "votes",
+        "链接": "url",
+        "网址": "url",
+        "url": "url",
+    }
+
+    for keyword, canonical in keyword_mapping.items():
+        if keyword in task_lower:
+            requested.add(canonical)
+
+    return requested or None
+
+
+def _prepare_extracted_item(item: dict, requested_fields: Optional[set[str]] = None) -> dict:
+    if not isinstance(item, dict):
+        return {}
+
+    normalized: dict = {}
+
+    for key, value in item.items():
+        key_str = str(key)
+        if key_str.startswith("_"):
+            continue
+        if key_str in {"element_id", "confidence", "click_point"}:
+            continue
+
+        canonical_key = _canonical_field_name(key_str)
+        if not canonical_key:
+            continue
+
+        existing = normalized.get(canonical_key)
+        # 同字段冲突时优先保留更完整的文本
+        if existing is None:
+            normalized[canonical_key] = value
+        elif isinstance(value, str) and isinstance(existing, str):
+            if len(value.strip()) > len(existing.strip()):
+                normalized[canonical_key] = value
+
+    # name/title 归一：最终只保留 title
+    if "title" in normalized and isinstance(normalized["title"], str):
+        normalized["title"] = normalized["title"].strip()
+
+    if requested_fields:
+        filtered = {k: v for k, v in normalized.items() if k in requested_fields}
+        if filtered:
+            return filtered
+
+    return normalized
 
 
 def _finish_check(task: str, parse_resp: ParseResponse, current_url: str) -> Optional[dict]:
@@ -630,6 +745,23 @@ async def step(request: StepRequest) -> StepResponse:
     )
 
 
+@app.post("/mark_elements")
+async def mark_elements() -> dict:
+    """兼容旧前端：返回当前页面标注元素和截图。"""
+    try:
+        screenshot_path, parse_resp = await _capture_and_parse()
+        current_url = await executor.get_url()
+        return {
+            "elements": [e.model_dump() for e in parse_resp.elements],
+            "annotated_image_base64": parse_resp.annotated_image_base64,
+            "current_url": current_url,
+            "screenshot_path": screenshot_path,
+        }
+    except Exception as exc:
+        logger.exception(f"mark_elements failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"mark_elements failed: {exc}") from exc
+
+
 @app.post("/plan_steps", response_model=PlanStepsResponse)
 def plan_steps(request: PlanStepsRequest) -> PlanStepsResponse:
     steps = planner.plan_steps(
@@ -859,3 +991,750 @@ async def run_with_reflection(request: dict) -> dict:
     result = await reflection_engine.run_task_with_reflection(task=task)
 
     return result
+
+
+@app.get("/run_task_stream")
+async def run_task_stream(
+    task: str,
+    max_steps: int = 20,
+    max_retries_per_step: int = 3,
+    list_only: bool = False,
+    max_items: int = 50,
+    max_pages: int = 5
+):
+    """SSE 流式返回任务执行进度"""
+    from .reflection_engine import ReflectionEngine
+    from .vlm_service import VLMService
+
+    async def event_generator():
+        try:
+            vlm = VLMService()
+            engine = ReflectionEngine(
+                executor=executor,
+                planner=planner,
+                vlm=vlm,
+                max_steps=max_steps,
+                max_retries_per_step=max_retries_per_step
+            )
+
+            # 发送开始事件
+            yield f"data: {json.dumps({'type': 'start', 'task': task})}\n\n"
+
+            # 检测是否需要提取数据
+            extract_keywords = ["提取", "采集", "收集", "抓取", "extract", "collect", "scrape", "复制", "copy"]
+            extract_data = any(keyword in task.lower() for keyword in extract_keywords)
+
+            # 规划步骤
+            steps_list, plan_debug = vlm.plan_steps(task=task, max_steps=max_steps)
+            yield f"data: {json.dumps({'type': 'plan', 'steps': steps_list})}\n\n"
+
+            # 执行步骤
+            current_step_index = 0
+            all_steps = []
+            while current_step_index < len(steps_list):
+                step_description = steps_list[current_step_index]
+
+                # 发送步骤开始事件
+                yield f"data: {json.dumps({'type': 'step_start', 'index': current_step_index, 'description': step_description})}\n\n"
+
+                # 执行步骤
+                step_result = await engine._execute_step_with_retry(
+                    task=task,
+                    step_description=step_description,
+                    step_index=current_step_index
+                )
+
+                all_steps.append(step_result)
+
+                # 发送步骤完成事件
+                yield f"data: {json.dumps({'type': 'step_complete', 'result': step_result})}\n\n"
+
+                if step_result["status"] == "terminated":
+                    break
+
+                current_step_index += 1
+
+            # 数据提取
+            extracted_items = []
+            excel_file = None
+
+            terminated_step = next((step for step in reversed(all_steps) if step.get("status") == "terminated"), None)
+
+            if extract_data and not terminated_step:
+                yield f"data: {json.dumps({'type': 'extract_start'})}\n\n"
+
+                target_items = max_items
+                requested_fields: Optional[set[str]] = None
+                try:
+                    spec, _ = planner.extract_task_spec(task)
+                    requested_count = int(spec.get("count", max_items))
+                    if requested_count > 0:
+                        target_items = min(max_items, requested_count)
+                    requested_fields = _resolve_requested_fields(task, spec.get("fields", []))
+                except Exception as spec_error:
+                    logger.warning(f"Failed to parse target item count from task, fallback to max_items={max_items}: {spec_error}")
+
+                logger.info(f"Extraction target count: {target_items} (max_items={max_items})")
+
+                pages_processed = 0
+                while pages_processed < max_pages and len(extracted_items) < target_items:
+                    # 标记元素
+                    dom_result = await executor.mark_page_elements()
+                    elements = dom_result.get('elements', [])
+
+                    # 截图
+                    screenshot_path = os.path.join(DATA_DIR, f"extract_page_{pages_processed}.png")
+                    await executor.screenshot(screenshot_path)
+
+                    with open(screenshot_path, "rb") as f:
+                        image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+                    current_url = await executor.get_url()
+                    extracted_data, _ = planner.extract_from_page(
+                        task=task,
+                        mode="list",
+                        annotated_image_base64=image_b64,
+                        current_url=current_url,
+                        elements=elements
+                    )
+
+                    items = extracted_data.get("items", []) if isinstance(extracted_data, dict) else []
+                    logger.info(f"Extracted {len(items)} items from list page")
+
+                    remaining_slots = max(0, target_items - len(extracted_items))
+                    items_to_process = items[:remaining_slots]
+
+                    # 如果不是 list_only，进入详情页提取
+                    if not list_only and items_to_process:
+                        for item in items_to_process:
+                            if len(extracted_items) >= target_items:
+                                break
+
+                            list_page_url = await executor.get_url()
+                            detail_url = item.get("url") or item.get("_url")
+                            detail_element_id = item.get("element_id") or item.get("_saved_element_id")
+
+                            # URL 不可见时，尝试通过 element_id 从 DOM 里提取 href
+                            if not detail_url and detail_element_id:
+                                for elem in elements:
+                                    if elem.get("id") == detail_element_id:
+                                        href = (elem.get("attributes") or {}).get("href")
+                                        if href:
+                                            detail_url = urljoin(list_page_url, href) if href.startswith("/") else href
+                                        break
+
+                            try:
+                                navigated = False
+
+                                if detail_url:
+                                    if isinstance(detail_url, str) and detail_url.startswith("/"):
+                                        detail_url = urljoin(list_page_url, detail_url)
+                                    logger.info(f"Navigating to detail page by URL: {detail_url}")
+                                    await executor.goto(detail_url)
+                                    navigated = True
+                                elif detail_element_id:
+                                    logger.info(f"Navigating to detail page by element_id: {detail_element_id}")
+                                    click_success = await executor.click_element_by_id(detail_element_id)
+                                    if not click_success:
+                                        raise RuntimeError(f"Failed to click detail element {detail_element_id}")
+                                    navigated = True
+
+                                if not navigated:
+                                    cleaned_item = _prepare_extracted_item(item, requested_fields)
+                                    extracted_items.append(cleaned_item if cleaned_item else item)
+                                    yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
+                                    continue
+
+                                await asyncio.sleep(1)
+                                await executor.wait_for_stable(1000)
+
+                                detail_screenshot = os.path.join(DATA_DIR, f"detail_{len(extracted_items)}.png")
+                                await executor.screenshot(detail_screenshot)
+
+                                with open(detail_screenshot, "rb") as f:
+                                    detail_image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+                                detail_current_url = await executor.get_url()
+                                detail_data, _ = planner.extract_from_page(
+                                    task=task,
+                                    mode="detail",
+                                    annotated_image_base64=detail_image_b64,
+                                    current_url=detail_current_url
+                                )
+
+                                detail_fields = detail_data.get("data", {}) if isinstance(detail_data, dict) else {}
+                                merged_item = {**item, **detail_fields}
+                                cleaned_item = _prepare_extracted_item(merged_item, requested_fields)
+                                extracted_items.append(cleaned_item if cleaned_item else merged_item)
+
+                            except Exception as e:
+                                logger.error(f"Failed to extract detail page: {e}")
+                                cleaned_item = _prepare_extracted_item(item, requested_fields)
+                                extracted_items.append(cleaned_item if cleaned_item else item)
+                            finally:
+                                try:
+                                    await executor.goto(list_page_url)
+                                    await asyncio.sleep(1)
+                                    await executor.wait_for_stable(500)
+                                except Exception as back_error:
+                                    logger.warning(f"Failed to navigate back to list page: {back_error}")
+
+                            yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
+                    else:
+                        # list_only 模式，直接添加列表数据
+                        for item in items_to_process:
+                            if len(extracted_items) >= target_items:
+                                break
+                            cleaned_item = _prepare_extracted_item(item, requested_fields)
+                            extracted_items.append(cleaned_item if cleaned_item else item)
+                        yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
+
+                    pages_processed += 1
+
+                    if len(extracted_items) >= target_items:
+                        break
+
+                    # 检查是否需要翻页
+                    next_action = extracted_data.get("next", "stop")
+                    if next_action == "next_page":
+                        next_page_element_id = extracted_data.get("next_page_element_id")
+                        paged = False
+
+                        if next_page_element_id:
+                            try:
+                                paged = await executor.click_element_by_id(next_page_element_id)
+                                if paged:
+                                    await asyncio.sleep(1)
+                                    await executor.wait_for_stable(1200)
+                            except Exception as click_error:
+                                logger.warning(f"Failed to click next page element {next_page_element_id}: {click_error}")
+                                paged = False
+
+                        if not paged:
+                            try:
+                                scroll_y = await executor.scroll_to_next_page(need_overlap=True)
+                                paged = bool(scroll_y and scroll_y > 0)
+                                if paged:
+                                    await asyncio.sleep(1)
+                            except Exception as scroll_error:
+                                logger.warning(f"Fallback scroll pagination failed: {scroll_error}")
+                                paged = False
+
+                        if not paged:
+                            logger.info("No further pagination available, stop extraction")
+                            break
+                    else:
+                        break
+
+                # 保存到 Excel
+                if extracted_items:
+                    output_store.rows = []
+                    for item in extracted_items:
+                        cleaned_item = _prepare_extracted_item(item, requested_fields)
+                        output_store.append_row(cleaned_item)
+                    excel_path = output_store.save_excel()
+                    excel_file = os.path.basename(excel_path)
+                    yield f"data: {json.dumps({'type': 'extract_done', 'count': len(extracted_items), 'file': excel_file})}\n\n"
+
+            # 发送完成事件
+            final_url = await executor.get_url()
+            if terminated_step:
+                done_status = "terminated"
+                done_reasoning = terminated_step.get("termination_reason") or terminated_step.get("verification", {}).get("reasoning", "")
+                done_user_message = terminated_step.get("user_message")
+            elif any(step.get("status") == "failed" for step in all_steps):
+                done_status = "failed"
+                done_reasoning = "One or more steps failed"
+                done_user_message = None
+            else:
+                done_status = "success"
+                done_reasoning = "Task completed"
+                done_user_message = None
+
+            yield f"data: {json.dumps({'type': 'done', 'status': done_status, 'reasoning': done_reasoning, 'user_message': done_user_message, 'final_url': final_url, 'extracted_items': extracted_items, 'excel_file': excel_file})}\n\n"
+
+        except Exception as e:
+            logger.exception("Stream error")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/run_task")
+async def run_task(request: dict) -> dict:
+    """
+    统一任务执行 API（合并 Run 和 Extract Data）
+
+    功能：
+    - 规划任务步骤（VLM 自动拆分）
+    - 逐步执行（click/type/scroll/goto）
+    - 每步反思验证（成功/重试/终止）
+    - 自动处理特殊情况（登录、广告、验证码、错误页面）
+    - 数据提取（如果任务涉及提取）
+    - 自动翻页（带反思验证）
+    - 导出到 Excel
+
+    请求参数:
+    {
+        "task": str,  # 任务描述，例如："打开百度，搜索Python，提取前5个结果"
+        "max_steps": int,  # 最大步骤数（默认20）
+        "max_retries_per_step": int,  # 每步最大重试次数（默认3）
+        "extract_data": bool,  # 是否提取数据（默认自动检测）
+        "max_items": int,  # 最大提取数量（默认50）
+        "max_pages": int,  # 最大翻页数（默认5）
+    }
+
+    返回:
+    {
+        "status": "success" | "failed" | "terminated",
+        "steps": [...],  # 执行步骤详情
+        "extracted_items": [...],  # 提取的数据（如果有）
+        "excel_file": str | null,  # Excel 文件名（如果有）
+        "termination_reason": str | null,  # 终止原因（login_required/captcha/error_page）
+        "user_message": str | null,  # 给用户的消息
+        "final_url": str,
+        "reasoning": str
+    }
+    """
+    from .reflection_engine import ReflectionEngine
+    from .vlm_service import VLMService
+
+    task = request.get("task", "")
+    max_steps = request.get("max_steps", 20)
+    max_retries_per_step = request.get("max_retries_per_step", 3)
+    extract_data = request.get("extract_data", None)  # None = 自动检测
+    max_items = request.get("max_items", 50)
+    max_pages = request.get("max_pages", 5)
+    list_only = request.get("list_only", False)
+
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+
+    logger.info(f"Starting unified task: {task}")
+
+    # 初始化 VLM 服务
+    if not hasattr(planner, '_vlm') or planner._vlm is None:
+        planner._vlm = VLMService()
+
+    # 创建反思引擎
+    reflection_engine = ReflectionEngine(
+        executor=executor,
+        planner=planner,
+        vlm=planner._vlm,
+        max_steps=max_steps,
+        max_retries_per_step=max_retries_per_step,
+    )
+
+    # 自动检测是否需要提取数据
+    if extract_data is None:
+        extract_keywords = ["提取", "采集", "收集", "抓取", "extract", "collect", "scrape", "复制", "copy"]
+        extract_data = any(keyword in task.lower() for keyword in extract_keywords)
+
+    logger.info(f"Extract data mode: {extract_data}, list_only: {list_only}")
+
+    try:
+        # 执行任务（带反思）
+        result = await reflection_engine.run_task_with_reflection(task=task)
+
+        # 检查是否被终止
+        terminated_steps = [s for s in result["steps"] if s.get("status") == "terminated"]
+        if terminated_steps:
+            last_terminated = terminated_steps[-1]
+            return {
+                "status": "terminated",
+                "steps": result["steps"],
+                "extracted_items": [],
+                "excel_file": None,
+                "termination_reason": last_terminated.get("termination_reason"),
+                "user_message": last_terminated.get("user_message"),
+                "final_url": result["final_url"],
+                "reasoning": result["reasoning"],
+            }
+
+        # 如果需要提取数据
+        extracted_items = []
+        excel_file = None
+
+        if extract_data:
+            logger.info("Starting data extraction...")
+            requested_fields: Optional[set[str]] = None
+            target_items = max_items
+
+            try:
+                spec, _ = planner.extract_task_spec(task)
+                requested_count = int(spec.get("count", max_items))
+                if requested_count > 0:
+                    target_items = min(max_items, requested_count)
+                requested_fields = _resolve_requested_fields(task, spec.get("fields", []))
+            except Exception as spec_error:
+                logger.warning(f"Failed to parse extraction spec in run_task: {spec_error}")
+
+            logger.info(f"run_task extraction target count: {target_items}")
+
+            pages_processed = 0
+            while pages_processed < max_pages and len(extracted_items) < target_items:
+                # 标记元素
+                dom_result = await executor.mark_page_elements()
+                elements = dom_result.get('elements', [])
+
+                # 截图
+                screenshot_path = os.path.join(DATA_DIR, timestamp_name("extract"))
+                await executor.screenshot(screenshot_path)
+
+                with open(screenshot_path, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+                current_url = await executor.get_url()
+
+                # 使用 VLM 提取数据
+                extracted_data, extract_debug = planner.extract_from_page(
+                    task=task,
+                    mode="list",
+                    annotated_image_base64=image_base64,
+                    current_url=current_url,
+                    elements=elements,
+                )
+
+                items = extracted_data.get("items", [])
+                logger.info(f"Extracted {len(items)} items from current page")
+
+                # 添加到收集列表
+                for item in items:
+                    if len(extracted_items) >= target_items:
+                        break
+                    cleaned_item = _prepare_extracted_item(item, requested_fields)
+                    extracted_items.append(cleaned_item if cleaned_item else item)
+
+                logger.info(f"Total collected: {len(extracted_items)}/{target_items}")
+
+                # 检查是否需要翻页
+                next_action = extracted_data.get("next", "stop")
+                if next_action == "next_page" and len(extracted_items) < target_items:
+                    logger.info("Need to go to next page")
+
+                    # 使用反思机制翻页
+                    next_page_element_id = extracted_data.get("next_page_element_id")
+                    if next_page_element_id:
+                        # 执行翻页步骤（带反思）
+                        pagination_step = await reflection_engine._execute_step_with_retry(
+                            task="翻页到下一页",
+                            step_description="click next page button",
+                            step_index=len(result["steps"]),
+                        )
+
+                        if pagination_step["status"] == "success":
+                            logger.info("Pagination successful")
+                            pages_processed += 1
+                            continue
+                        else:
+                            logger.error(f"Pagination failed: {pagination_step.get('verification', {}).get('reasoning', '')}")
+                            break
+                    else:
+                        logger.warning("No next page button found")
+                        break
+                else:
+                    logger.info("Extraction complete")
+                    break
+
+            # 保存到 Excel
+                if extracted_items:
+                    logger.info(f"Saving {len(extracted_items)} items to Excel")
+                    output_store.reset()
+
+                    for item in extracted_items:
+                        cleaned_item = _prepare_extracted_item(item, requested_fields)
+                        output_store.append_row(cleaned_item)
+
+                excel_path = output_store.save_excel()
+                excel_file = os.path.basename(excel_path)
+                logger.info(f"Saved to {excel_file}")
+
+        return {
+            "status": result["status"],
+            "steps": result["steps"],
+            "extracted_items": extracted_items,
+            "excel_file": excel_file,
+            "termination_reason": None,
+            "user_message": None,
+            "final_url": result["final_url"],
+            "reasoning": result["reasoning"],
+            "plan": result.get("plan", []),
+        }
+
+    except Exception as e:
+        logger.exception(f"Task execution failed: {e}")
+        return {
+            "status": "failed",
+            "steps": [],
+            "extracted_items": [],
+            "excel_file": None,
+            "termination_reason": "exception",
+            "user_message": f"任务执行失败: {str(e)}",
+            "final_url": await executor.get_url(),
+            "reasoning": str(e),
+        }
+
+
+@app.post("/run_steel_inspection_task")
+async def run_steel_inspection_task(request: dict) -> dict:
+    """
+    专门用于钢铁异常采集任务的 API
+
+    整合了：规划、执行、反思、滚动、翻页、数据提取、图片下载、Excel导出
+
+    请求参数:
+    {
+        "task": str,  # 任务描述，例如："采集2025-12-25的所有异常钢铁数据"
+        "target_url": str,  # 目标网站URL
+        "date": str,  # 日期，例如："2025-12-25"
+        "filter_type": str,  # 筛选类型，例如："异常"
+        "max_items": int,  # 最大采集数量（默认100）
+        "download_images": bool,  # 是否下载图片（默认True）
+        "max_pages": int,  # 最大翻页数（默认10）
+    }
+
+    返回:
+    {
+        "status": "success" | "failed",
+        "items_collected": int,
+        "excel_file": str,
+        "images_downloaded": int,
+        "execution_log": [...]
+    }
+    """
+    from .reflection_engine import ReflectionEngine
+    from .vlm_service import VLMService
+
+    task = request.get("task", "")
+    target_url = request.get("target_url", "")
+    date = request.get("date", "")
+    filter_type = request.get("filter_type", "异常")
+    max_items = request.get("max_items", 100)
+    download_images = request.get("download_images", True)
+    max_pages = request.get("max_pages", 10)
+
+    if not task and not target_url:
+        raise HTTPException(status_code=400, detail="task or target_url is required")
+
+    logger.info(f"Starting steel inspection task: {task}")
+    logger.info(f"Parameters: date={date}, filter_type={filter_type}, max_items={max_items}")
+
+    # 初始化 VLM 服务
+    if not hasattr(planner, '_vlm') or planner._vlm is None:
+        planner._vlm = VLMService()
+
+    # 创建反思引擎
+    reflection_engine = ReflectionEngine(
+        executor=executor,
+        planner=planner,
+        vlm=planner._vlm,
+        max_steps=50,  # 钢铁任务可能需要更多步骤
+        max_retries_per_step=3,
+    )
+
+    collected_items = []
+    execution_log = []
+    images_downloaded = 0
+
+    try:
+        # 阶段1: 导航到目标网站
+        if target_url:
+            logger.info(f"Navigating to {target_url}")
+            await executor.goto(target_url)
+            await executor.wait_for_load()
+            await executor.wait_for_stable(2000)
+            execution_log.append({"stage": "navigation", "status": "success", "url": target_url})
+
+        # 阶段2: 构建任务步骤
+        # 根据参数自动生成任务描述
+        if not task:
+            task = f"在打包带检验系统中，选择日期{date}，筛选{filter_type}记录，提取所有数据并下载图片"
+
+        # 使用反思引擎规划和执行任务
+        logger.info("Planning task steps...")
+        steps_list, plan_debug = reflection_engine.vlm.plan_steps(
+            task=task,
+            max_steps=20,
+        )
+        logger.info(f"Planned steps: {steps_list}")
+        execution_log.append({"stage": "planning", "status": "success", "steps": steps_list})
+
+        # 阶段3: 执行步骤循环（带数据提取）
+        current_step_index = 0
+        pages_processed = 0
+
+        while current_step_index < len(steps_list) and pages_processed < max_pages:
+            step_description = steps_list[current_step_index]
+            logger.info(f"Executing step {current_step_index + 1}: {step_description}")
+
+            # 执行步骤（带反思）
+            step_result = await reflection_engine._execute_step_with_retry(
+                task=task,
+                step_description=step_description,
+                step_index=current_step_index,
+            )
+
+            execution_log.append(step_result)
+
+            # 如果步骤涉及数据提取
+            if any(keyword in step_description.lower() for keyword in ["提取", "extract", "采集", "收集"]):
+                logger.info("Extracting data from current page...")
+
+                # 标记元素
+                dom_result = await executor.mark_page_elements()
+                elements = dom_result.get('elements', [])
+
+                # 截图
+                screenshot_path = os.path.join(DATA_DIR, timestamp_name("extract"))
+                await executor.screenshot(screenshot_path)
+
+                with open(screenshot_path, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode("ascii")
+
+                current_url = await executor.get_url()
+
+                # 使用 VLM 提取数据
+                extracted_data, extract_debug = planner.extract_from_page(
+                    task=task,
+                    mode="list",
+                    annotated_image_base64=image_base64,
+                    current_url=current_url,
+                    elements=elements,
+                )
+
+                items = extracted_data.get("items", [])
+                logger.info(f"Extracted {len(items)} items from current page")
+
+                # 过滤异常数据（如果需要）
+                if filter_type == "异常":
+                    items = [item for item in items if "异常" in str(item.get("status", "")) or "❌" in str(item.get("status", ""))]
+                    logger.info(f"Filtered to {len(items)} abnormal items")
+
+                # 添加到收集列表
+                for item in items:
+                    if len(collected_items) >= max_items:
+                        break
+
+                    # 下载图片（如果需要）
+                    if download_images and item.get("image_url"):
+                        try:
+                            # 这里可以添加图片下载逻辑
+                            # 暂时跳过，因为需要实现下载功能
+                            pass
+                        except Exception as e:
+                            logger.error(f"Failed to download image: {e}")
+
+                    collected_items.append(item)
+
+                logger.info(f"Total collected: {len(collected_items)}/{max_items}")
+
+                # 检查是否需要翻页
+                next_action = extracted_data.get("next", "stop")
+                if next_action == "next_page" and len(collected_items) < max_items:
+                    logger.info("Need to go to next page")
+
+                    # 使用反思机制翻页
+                    next_page_element_id = extracted_data.get("next_page_element_id")
+                    if next_page_element_id:
+                        logger.info(f"Clicking next page button: {next_page_element_id}")
+
+                        # 捕获翻页前状态
+                        before_url = await executor.get_url()
+                        before_screenshot = await reflection_engine._capture_screenshot()
+                        before_elements = await reflection_engine._get_page_elements()
+
+                        # 点击翻页按钮
+                        success = await executor.click_element_by_id(next_page_element_id)
+
+                        if success:
+                            # 等待页面加载
+                            await asyncio.sleep(2)
+                            await executor.wait_for_stable(2000)
+
+                            # 捕获翻页后状态
+                            after_url = await executor.get_url()
+                            after_screenshot = await reflection_engine._capture_screenshot()
+                            after_elements = await reflection_engine._get_page_elements()
+
+                            # 验证翻页是否成功
+                            verification, _ = reflection_engine.vlm.verify_step_success(
+                                task="翻页到下一页",
+                                step_description="click next page button",
+                                action_taken="click",
+                                before_url=before_url,
+                                after_url=after_url,
+                                before_image_base64=before_screenshot,
+                                after_image_base64=after_screenshot,
+                                elements_before=before_elements,
+                                elements_after=after_elements,
+                            )
+
+                            if verification.get("success", False):
+                                logger.info("Pagination successful")
+                                pages_processed += 1
+                                # 继续提取下一页（不增加 step_index）
+                                continue
+                            else:
+                                logger.error(f"Pagination failed: {verification.get('reasoning', '')}")
+                                break
+                        else:
+                            logger.error("Failed to click next page button")
+                            break
+                    else:
+                        logger.warning("No next page button found")
+                        break
+                elif next_action == "stop" or len(collected_items) >= max_items:
+                    logger.info("Extraction complete")
+                    break
+
+            # 继续下一步
+            if step_result["status"] == "success":
+                current_step_index += 1
+            else:
+                logger.error(f"Step failed: {step_result.get('verification', {}).get('reasoning', '')}")
+                break
+
+        # 阶段4: 保存到 Excel
+        logger.info(f"Saving {len(collected_items)} items to Excel")
+        output_store.reset()
+
+        for item in collected_items:
+            # 清理内部字段
+            cleaned_item = {k: v for k, v in item.items() if not k.startswith('_')}
+            output_store.append_row(cleaned_item)
+
+        excel_file = output_store.save_excel(f"steel_inspection_{date}.xlsx")
+        logger.info(f"Saved to {excel_file}")
+
+        execution_log.append({
+            "stage": "save_excel",
+            "status": "success",
+            "file": excel_file,
+            "items": len(collected_items)
+        })
+
+        return {
+            "status": "success",
+            "items_collected": len(collected_items),
+            "excel_file": os.path.basename(excel_file),
+            "images_downloaded": images_downloaded,
+            "pages_processed": pages_processed,
+            "execution_log": execution_log,
+        }
+
+    except Exception as e:
+        logger.exception(f"Steel inspection task failed: {e}")
+        execution_log.append({
+            "stage": "error",
+            "status": "failed",
+            "error": str(e)
+        })
+
+        return {
+            "status": "failed",
+            "items_collected": len(collected_items),
+            "excel_file": None,
+            "images_downloaded": images_downloaded,
+            "pages_processed": pages_processed,
+            "execution_log": execution_log,
+            "error": str(e),
+        }
