@@ -31,6 +31,55 @@ type RunTaskResponse = {
   plan?: string[];
 };
 
+type StreamStepItem = {
+  step_index: number;
+  retry_index: number;
+  description: string;
+  action: string;
+  verification: Record<string, unknown>;
+  status: string;
+  termination_reason?: string;
+  user_message?: string;
+};
+
+const STEEL_STAGE_TITLE: Record<string, string> = {
+  auth: "加载登录态",
+  navigation: "进入历史记录页",
+  date: "设置日期范围",
+  filter: "筛选异常状态",
+  wait_ready: "等待筛选结果",
+  download_excel: "下载异常Excel",
+  download_zip: "下载原始图片ZIP",
+  download_zip_retry: "重试图片下载",
+  recover: "恢复后重试",
+  unzip: "解压图片文件",
+  embed: "生成带图Excel",
+  done: "钢铁任务完成",
+  failed: "钢铁任务失败",
+};
+
+const toSteelStep = (
+  stage: string,
+  message: string,
+  index: number,
+): StreamStepItem => {
+  const normalizedStage = (stage || "stage").trim();
+  const normalizedMessage = (message || "").trim();
+  const isFailed = normalizedStage === "failed";
+  const isDone = normalizedStage === "done";
+
+  return {
+    step_index: index,
+    retry_index: normalizedStage.includes("retry") ? 1 : 0,
+    description: STEEL_STAGE_TITLE[normalizedStage] || normalizedMessage || normalizedStage,
+    action: normalizedStage,
+    verification: normalizedMessage ? { reasoning: normalizedMessage } : {},
+    status: isFailed ? "failed" : (isDone ? "success" : "success"),
+    termination_reason: isFailed ? normalizedMessage : undefined,
+    user_message: isFailed ? normalizedMessage : undefined,
+  };
+};
+
 type FileListResponse = {
   files: string[];
 };
@@ -48,6 +97,7 @@ function App() {
   const [taskResult, setTaskResult] = useState<RunTaskResponse | null>(null);
   const [files, setFiles] = useState<string[]>([]);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const steelStepKeysRef = useRef<Set<string>>(new Set());
 
   const imgSrc = useMemo(() => {
     if (!annotated) return null;
@@ -80,6 +130,7 @@ function App() {
     setStatus("执行任务中...");
     setSelectedId(null);
     setTaskResult(null);
+    steelStepKeysRef.current = new Set();
 
     try {
       const maxItems = parseMaxItemsFromTask(task);
@@ -93,9 +144,31 @@ function App() {
       });
 
       const eventSource = new EventSource(`${API_BASE}/run_task_stream?${params}`);
+      let streamCompleted = false;
 
       eventSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
+
+        if (data.type === "steel_stage") {
+          const stage = data.stage ? ` [${data.stage}]` : "";
+          const message = data.message || "钢铁流程执行中";
+          setStatus(`🎮${stage} ${message}`);
+
+          const stageName = String(data.stage || "").trim();
+          const stepKey = `${stageName}::${message}`;
+          if (!steelStepKeysRef.current.has(stepKey)) {
+            steelStepKeysRef.current.add(stepKey);
+            setTaskResult(prev => {
+              if (!prev) return prev;
+              const nextIndex = prev.steps.length;
+              return {
+                ...prev,
+                steps: [...prev.steps, toSteelStep(stageName, message, nextIndex)],
+              };
+            });
+          }
+          return;
+        }
 
         if (data.type === "start") {
           setStatus("🚀 开始执行任务...");
@@ -137,6 +210,8 @@ function App() {
             handleRefreshFiles();
           }
         } else if (data.type === "done") {
+          streamCompleted = true;
+          const isSteelRun = Boolean(data.steel_result);
           setTaskResult(prev => {
             if (!prev) return null;
             return {
@@ -147,6 +222,9 @@ function App() {
               excel_file: data.excel_file || null
             };
           });
+          if (data.excel_file) {
+            void handleRefreshFiles();
+          }
           if (data.status === "terminated") {
             setStatus(`⚠️ 任务终止: ${data.user_message || data.reasoning || "已终止"}`);
           } else if (data.status === "failed") {
@@ -157,8 +235,11 @@ function App() {
           setCurrentUrl(data.final_url);
           eventSource.close();
           setLoading(false);
-          handleMark();
+          if (!isSteelRun) {
+            handleMark();
+          }
         } else if (data.type === "error") {
+          streamCompleted = true;
           setStatus(`❌ 错误: ${data.message}`);
           setTaskResult(prev => prev ? { ...prev, status: "failed", reasoning: data.message || prev.reasoning } : prev);
           eventSource.close();
@@ -167,6 +248,9 @@ function App() {
       };
 
       eventSource.onerror = () => {
+        if (streamCompleted) {
+          return;
+        }
         setStatus("❌ 连接中断");
         setTaskResult(prev => prev ? { ...prev, status: prev.status === "running" ? "failed" : prev.status } : prev);
         eventSource.close();

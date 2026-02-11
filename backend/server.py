@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
+import inspect
 import json
 import logging
 import os
 import re
-from typing import Optional
-from urllib.parse import urljoin
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 
 from dotenv import load_dotenv
 
@@ -29,6 +35,7 @@ from .storage import ensure_dir, timestamp_name
 from .extraction_engine import ExtractionEngine
 from .visualizer import annotate_screenshot_base64
 from .vlm_service import VLMService
+from .steel_excel_image_mapper import generate_excel_with_embedded_images
 from PIL import Image
 import io
 
@@ -260,21 +267,39 @@ def _canonical_field_name(field: str) -> str:
     mapping = {
         "name": "title",
         "book_name": "title",
+        "movie_name": "title",
         "title": "title",
         "书名": "title",
+        "片名": "title",
+        "电影名": "title",
         "价格": "price",
         "price": "price",
         "作者": "author",
         "author": "author",
+        "director": "author",
+        "导演": "author",
+        "编剧": "author",
         "vote": "votes",
         "votes": "votes",
-        "rating": "votes",
-        "评分": "votes",
+        "vote_count": "votes",
+        "votes_count": "votes",
+        "rating_count": "votes",
+        "review_count": "votes",
+        "评分人数": "votes",
+        "评价人数": "votes",
+        "rating": "rating",
+        "score": "rating",
+        "评分": "rating",
         "链接": "url",
         "link": "url",
         "url": "url",
         "摘要": "summary",
         "summary": "summary",
+        "简介": "summary",
+        "内容简介": "summary",
+        "description": "summary",
+        "overview": "summary",
+        "plot": "summary",
         "内容": "content",
         "content": "content",
         "时间": "time",
@@ -306,14 +331,28 @@ def _resolve_requested_fields(task: str, spec_fields: Optional[list]) -> Optiona
         "标题": "title",
         "title": "title",
         "name": "title",
+        "片名": "title",
+        "电影名": "title",
         "价格": "price",
         "price": "price",
         "作者": "author",
         "author": "author",
-        "评分": "votes",
+        "导演": "author",
+        "评分": "rating",
+        "score": "rating",
+        "rating": "rating",
+        "评分人数": "votes",
+        "评价人数": "votes",
+        "投票人数": "votes",
         "投票": "votes",
         "votes": "votes",
-        "rating": "votes",
+        "vote": "votes",
+        "简介": "summary",
+        "内容简介": "summary",
+        "summary": "summary",
+        "description": "summary",
+        "内容": "content",
+        "content": "content",
         "链接": "url",
         "网址": "url",
         "url": "url",
@@ -361,6 +400,1168 @@ def _prepare_extracted_item(item: dict, requested_fields: Optional[set[str]] = N
             return filtered
 
     return normalized
+
+
+def _build_extracted_item_key(item: dict) -> str:
+    """构建去重键，优先 URL，其次标题+作者/评分。"""
+    if not isinstance(item, dict):
+        return ""
+
+    def _norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    url_value = _norm(item.get("url") or item.get("link") or item.get("_url"))
+    if url_value:
+        return f"url::{url_value}"
+
+    title_value = _norm(item.get("title") or item.get("name") or item.get("movie_name") or item.get("书名") or item.get("片名"))
+    author_value = _norm(item.get("author") or item.get("director") or item.get("导演"))
+    rating_value = _norm(item.get("rating") or item.get("score") or item.get("评分"))
+
+    if title_value:
+        return f"title::{title_value}|author::{author_value}|rating::{rating_value}"
+
+    return ""
+
+
+def _is_steel_inspection_task(task: str) -> bool:
+    task_lower = (task or "").lower()
+    required_groups = [
+        ["日期", "date"],
+        ["异常", "abnormal"],
+        ["导出", "excel", "下载"],
+    ]
+    domain_keywords = ["钢铁", "打包", "打包带", "检验", "检验系统", "production", "coil"]
+    has_domain = any(keyword in task_lower for keyword in domain_keywords)
+    has_required = all(any(keyword in task_lower for keyword in group) for group in required_groups)
+    return has_domain or has_required
+
+
+def _extract_date_range(task: str) -> tuple[str, str]:
+    task_text = task or ""
+
+    range_match = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}).{0,6}(\d{4}[-/]\d{1,2}[-/]\d{1,2})", task_text)
+    if range_match:
+        start = range_match.group(1).replace("/", "-")
+        end = range_match.group(2).replace("/", "-")
+        return start, end
+
+    single_match = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})", task_text)
+    if single_match:
+        date_str = single_match.group(1).replace("/", "-")
+        return date_str, date_str
+
+    today = dt.date.today().strftime("%Y-%m-%d")
+    return today, today
+
+
+def _extract_target_url(task: str, fallback: Optional[str] = None) -> Optional[str]:
+    if fallback:
+        return fallback
+    match = re.search(r"https?://[^\s，。]+", task or "")
+    if match:
+        return match.group(0)
+    env_url = os.getenv("STEEL_TARGET_URL", "").strip()
+    return env_url or None
+
+
+def _resolve_auth_data_file(auth_data_file: Optional[str] = None, target_url: Optional[str] = None) -> Optional[str]:
+    project_root = Path(__file__).resolve().parent.parent
+
+    def _resolve_path(candidate: str) -> Path:
+        candidate_path = Path(candidate)
+        if not candidate_path.is_absolute():
+            candidate_path = project_root / candidate_path
+        return candidate_path
+
+    explicit_candidate = (auth_data_file or "").strip() or os.getenv("STEEL_AUTH_DATA_FILE", "").strip()
+    if explicit_candidate:
+        return str(_resolve_path(explicit_candidate))
+
+    cookies_dir = project_root / "cookies"
+    if not cookies_dir.exists() or not cookies_dir.is_dir():
+        return None
+
+    host = (urlparse(target_url).hostname or "").strip().lower() if target_url else ""
+    candidates: list[Path] = []
+
+    if host:
+        for pattern in [f"auth_data_{host}*.json", f"cookies_{host}*.json", f"*{host}*.json"]:
+            candidates.extend(cookies_dir.glob(pattern))
+
+    if not candidates:
+        candidates.extend(cookies_dir.glob("auth_data_*.json"))
+
+    existing = [p for p in candidates if p.exists() and p.is_file()]
+    if not existing:
+        return None
+
+    latest = max(existing, key=lambda p: p.stat().st_mtime)
+    return str(latest)
+
+
+def _extract_target_url_from_auth_data(auth_data_file: Optional[str] = None, fallback_url: Optional[str] = None) -> Optional[str]:
+    resolved_path = _resolve_auth_data_file(auth_data_file=auth_data_file, target_url=fallback_url)
+    if not resolved_path or not os.path.exists(resolved_path):
+        return None
+
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+        auth_url = (auth_data.get("url") or "").strip()
+        return auth_url or None
+    except Exception as exc:
+        logger.warning(f"Failed to read target url from auth_data file {resolved_path}: {exc}")
+        return None
+
+
+def _extract_auth_data_path_from_task(task: str) -> Optional[str]:
+    match = re.search(r"auth[_-]?data[^\s\"']*\.json", task or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(0)
+
+
+def _parse_cookie_header(cookie_header: str, target_url: str) -> list[dict]:
+    parsed = urlparse(target_url)
+    host = parsed.hostname
+    secure = (parsed.scheme or "").lower() == "https"
+    if not host:
+        return []
+
+    cookies: list[dict] = []
+    for chunk in cookie_header.split(";"):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value.strip(),
+                "domain": host,
+                "path": "/",
+                "secure": secure,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            }
+        )
+    return cookies
+
+
+async def _apply_auth_data_if_available(target_url: str, auth_data_file: Optional[str] = None) -> Optional[str]:
+    resolved_path = _resolve_auth_data_file(auth_data_file=auth_data_file, target_url=target_url)
+    if not resolved_path:
+        return None
+
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"auth_data 文件不存在: {resolved_path}")
+
+    with open(resolved_path, "r", encoding="utf-8") as f:
+        auth_data = json.load(f)
+
+    await executor._ensure_page()
+    context = executor._context
+    page = executor._page
+
+    raw_cookies = auth_data.get("cookies")
+    cookies_to_add: list[dict] = []
+    if isinstance(raw_cookies, list):
+        cookies_to_add = raw_cookies
+    elif isinstance(raw_cookies, str) and raw_cookies.strip():
+        cookies_to_add = _parse_cookie_header(raw_cookies, target_url)
+
+    if cookies_to_add:
+        await context.add_cookies(cookies_to_add)
+
+    local_storage = auth_data.get("localStorage") if isinstance(auth_data.get("localStorage"), dict) else {}
+    session_storage = auth_data.get("sessionStorage") if isinstance(auth_data.get("sessionStorage"), dict) else {}
+
+    if local_storage or session_storage:
+        parsed = urlparse(target_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        await page.goto(origin)
+        await page.wait_for_load_state("domcontentloaded")
+        await page.evaluate(
+            """
+            (payload) => {
+              const localData = payload.localData || {};
+              const sessionData = payload.sessionData || {};
+              for (const [k, v] of Object.entries(localData)) {
+                localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v));
+              }
+              for (const [k, v] of Object.entries(sessionData)) {
+                sessionStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v));
+              }
+            }
+            """,
+            {"localData": local_storage, "sessionData": session_storage},
+        )
+
+    return resolved_path
+
+
+def _extract_int_from_task(task: str, patterns: list[str], default: int, minimum: int = 1, maximum: int = 500) -> int:
+    task_lower = (task or "").lower()
+    for pattern in patterns:
+        match = re.search(pattern, task_lower)
+        if match:
+            value = int(match.group(1))
+            return max(minimum, min(maximum, value))
+    return default
+
+
+def _build_history_url(url: str) -> str:
+    normalized = (url or "").strip()
+    if not normalized:
+        return normalized
+    if "#/history" in normalized:
+        return normalized
+    if "#/" in normalized:
+        return re.sub(r"#/.+$", "#/history", normalized)
+    if normalized.endswith("/"):
+        return f"{normalized}#/history"
+    return f"{normalized}/#/history"
+
+
+async def _ensure_history_page(target_url: str, timeout_ms: int = 15000) -> tuple[str, bool]:
+    """确保页面停留在历史记录页（#/history）。"""
+    await executor._ensure_page()
+    page = executor._page
+    try:
+        current_url = page.url or ""
+    except Exception:
+        current_url = ""
+    if "#/history" in current_url:
+        return current_url, False
+
+    history_url = _build_history_url(target_url or current_url)
+    logger.warning(f"Detected non-history route, redirecting to history page: {current_url} -> {history_url}")
+
+    redirected = False
+    for attempt in range(2):
+        try:
+            await page.goto(history_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await executor.wait_for_load(timeout_ms=timeout_ms)
+            await executor.wait_for_stable(1200)
+            redirected = True
+            break
+        except Exception as exc:
+            logger.warning(f"Redirect to history failed (attempt {attempt + 1}/2): {exc}")
+            await asyncio.sleep(0.6)
+            await executor._ensure_page()
+            page = executor._page
+            try:
+                current_url = page.url or ""
+            except Exception:
+                current_url = ""
+            if "#/history" in current_url:
+                return current_url, True
+
+    try:
+        current_url = page.url or ""
+    except Exception:
+        current_url = history_url
+    if "#/history" in current_url:
+        return current_url, True
+
+    logger.warning(f"History guard degraded; keep current route for now: {current_url}")
+    return current_url, redirected
+
+
+async def _ensure_active_history_page(target_url: str, timeout_ms: int = 15000) -> tuple[str, bool]:
+    """确保执行器当前页是可操作的历史记录页，优先处理 about:blank/新标签页干扰。"""
+    await executor._ensure_page()
+    switched = False
+
+    try:
+        current_url = (executor._page.url or "").strip()
+    except Exception:
+        current_url = ""
+
+    if (not current_url or current_url.lower().startswith("about:blank")) and getattr(executor, "_context", None):
+        try:
+            target_host = (urlparse(target_url).hostname or "").lower()
+            preferred_page = None
+            fallback_page = None
+            for candidate in reversed(list(executor._context.pages)):
+                try:
+                    if candidate.is_closed():
+                        continue
+                    candidate_url = (candidate.url or "").strip()
+                except Exception:
+                    continue
+
+                if not candidate_url or candidate_url.lower().startswith("about:blank"):
+                    continue
+                if "#/history" in candidate_url:
+                    preferred_page = candidate
+                    break
+                if target_host and target_host in candidate_url.lower() and fallback_page is None:
+                    fallback_page = candidate
+
+            chosen = preferred_page or fallback_page
+            if chosen is not None and chosen is not executor._page:
+                executor._page = chosen
+                switched = True
+                try:
+                    await chosen.bring_to_front()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning(f"Failed to switch from about:blank to existing history tab: {exc}")
+
+    ensure_target_url = (target_url or current_url).strip()
+    if not ensure_target_url:
+        return current_url, switched
+
+    current_url, redirected = await _ensure_history_page(ensure_target_url, timeout_ms=timeout_ms)
+    return current_url, (switched or redirected)
+
+
+def _is_login_route(url: Optional[str]) -> bool:
+    text = (url or "").lower()
+    return "#/login" in text or "/login" in text
+
+
+async def _set_date_inputs(start_date: str, end_date: str) -> None:
+    """尽量鲁棒地设置页面上的开始/结束日期输入框。"""
+    await executor._ensure_page()
+    page = executor._page
+
+    script = """
+    (payload) => {
+      const startDate = payload.startDate;
+      const endDate = payload.endDate;
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const inFilterBar = (el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.top >= 50 && rect.top <= 150;
+      };
+
+      const formatDateTime = (value, isEnd) => {
+        const str = String(value || '');
+        if (/\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(str)) return str;
+        if (/\d{4}-\d{2}-\d{2}/.test(str)) {
+          return `${str} ${isEnd ? '23:59:59' : '00:00:00'}`;
+        }
+        return str;
+      };
+
+      const writeValue = (el, value) => {
+        el.focus();
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) {
+          setter.call(el, value);
+        } else {
+          el.value = value;
+        }
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+
+      const startVal = formatDateTime(startDate, false);
+      const endVal = formatDateTime(endDate, true);
+
+      const rangeInputs = Array.from(document.querySelectorAll('input.el-range-input'))
+        .filter(el => isVisible(el) && inFilterBar(el));
+      if (rangeInputs.length >= 2) {
+        writeValue(rangeInputs[0], startVal);
+        writeValue(rangeInputs[1], endVal);
+        rangeInputs[1].blur();
+        return { ok: true, mode: 'el_range_input' };
+      }
+
+      const candidates = Array.from(document.querySelectorAll('input'))
+        .filter(el => isVisible(el) && inFilterBar(el))
+        .filter(el => {
+          const attrs = [el.name, el.id, el.placeholder, el.getAttribute('aria-label'), el.type]
+            .map(v => (v || '').toLowerCase()).join(' ');
+          return /date|日期|start|begin|from|end|to|time|时间/.test(attrs);
+        });
+
+      if (candidates.length < 2) {
+        return { ok: false, reason: 'date_inputs_not_found', count: candidates.length };
+      }
+
+      writeValue(candidates[0], startVal);
+      writeValue(candidates[1], endVal);
+      candidates[1].blur();
+      return { ok: true, mode: 'generic_input' };
+    }
+    """
+
+    result = await page.evaluate(script, {"startDate": start_date, "endDate": end_date})
+    if not result.get("ok", False):
+        raise RuntimeError(f"Failed to set date inputs: {result}")
+
+
+async def _select_abnormal_status() -> bool:
+    """选择打包状态=异常，仅在表头筛选与弹层菜单中定位，避免误触左侧菜单。"""
+    await executor._ensure_page()
+    page = executor._page
+
+    header_cell = page.locator(".el-table__header-wrapper th", has_text="打包状态").first
+    header_candidates = [
+        header_cell.locator(".column-filter, .el-icon, svg, i").first,
+        header_cell,
+    ]
+
+    opened = False
+    for locator in header_candidates:
+        try:
+            await locator.wait_for(state="visible", timeout=2500)
+            await locator.click(timeout=2500)
+            opened = True
+            break
+        except Exception:
+            continue
+
+    if not opened:
+        return False
+
+    await asyncio.sleep(0.25)
+    option_selectors = [
+        page.locator(".el-popper.pop-filter").first.get_by_text("异常", exact=True),
+        page.locator(".el-popper.pop-filter *", has_text="异常").first,
+        page.locator(".el-popper .el-dropdown-menu__item", has_text="异常").first,
+        page.locator(".el-table-filter__list-item", has_text="异常").first,
+        page.locator(".el-select-dropdown__item", has_text="异常").first,
+        page.locator(".el-popper li", has_text="异常").first,
+    ]
+
+    for locator in option_selectors:
+        try:
+            await locator.wait_for(state="visible", timeout=2500)
+            await locator.click(timeout=2500)
+            await asyncio.sleep(0.4)
+            return True
+        except Exception:
+            continue
+
+    clicked_in_pop_filter = await page.evaluate(
+        """
+        () => {
+          const isVisible = (el) => {
+            const s = getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          };
+
+          const pop = Array.from(document.querySelectorAll('.el-popper.pop-filter'))
+            .find(el => isVisible(el));
+          if (!pop) return false;
+
+          const candidates = Array.from(pop.querySelectorAll('button, a, li, div, span, label'));
+          for (const el of candidates) {
+            if (!isVisible(el)) continue;
+            const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+            if (text === '异常' || text.includes('异常')) {
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        }
+        """
+    )
+    if clicked_in_pop_filter:
+        await asyncio.sleep(0.4)
+        return True
+
+    return False
+
+
+async def _click_by_text_and_download(text_patterns: list[str], save_path: str, timeout_ms: int = 45000) -> str:
+    """点击文本按钮并捕获下载文件。"""
+    await executor._ensure_page()
+    page = executor._page
+
+    trigger_script = """
+    (patterns) => {
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const all = Array.from(document.querySelectorAll('button, a, span, div'));
+      const lowerPatterns = patterns.map(p => p.toLowerCase());
+      const target = all.find(el => {
+        const text = (el.innerText || '').toLowerCase().trim();
+        if (!text || !isVisible(el)) return false;
+        return lowerPatterns.some(p => text.includes(p));
+      });
+
+      if (!target) return { ok: false };
+      target.click();
+      return { ok: true };
+    }
+    """
+
+    async with page.expect_download(timeout=timeout_ms) as download_info:
+        clicked = await page.evaluate(trigger_script, text_patterns)
+        if not clicked.get("ok", False):
+            raise RuntimeError(f"Failed to click download trigger by text: {text_patterns}")
+
+    download = await download_info.value
+    await download.save_as(save_path)
+    return save_path
+
+
+def _unzip_file(zip_path: str, extract_dir: str) -> str:
+    ensure_dir(extract_dir)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+    return extract_dir
+
+
+def _find_picture_root(extract_dir: str) -> Optional[str]:
+    root = Path(extract_dir)
+    candidates = [p for p in root.rglob("picture") if p.is_dir()]
+    if candidates:
+        return str(candidates[0])
+    # 兜底：找第一个包含图片的目录
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    for directory in [p for p in root.rglob("*") if p.is_dir()]:
+        if any(child.suffix.lower() in image_exts for child in directory.iterdir() if child.is_file()):
+            return str(directory)
+    return None
+
+
+def _build_text_blob(element: dict) -> str:
+    attrs = element.get("attributes") or {}
+    fields = [
+        element.get("text") or "",
+        element.get("tagName") or "",
+        attrs.get("id") or "",
+        attrs.get("class") or "",
+        attrs.get("name") or "",
+        attrs.get("placeholder") or "",
+        attrs.get("value") or "",
+    ]
+    return " ".join(str(v) for v in fields if v).lower()
+
+
+def _is_element_enabled_for_action(element: dict) -> bool:
+    attrs = element.get("attributes") or {}
+    class_name = str(attrs.get("class") or "").lower()
+    text_blob = _build_text_blob(element)
+    blocked_tokens = ["disabled", "is-disabled", "not-allowed"]
+    return not any(token in class_name or token in text_blob for token in blocked_tokens)
+
+
+def _match_element_score(element: dict, include_keywords: list[str], exclude_keywords: Optional[list[str]] = None) -> int:
+    text_blob = _build_text_blob(element)
+    score = 0
+    for keyword in include_keywords:
+        k = keyword.lower()
+        if k and k in text_blob:
+            score += 3
+    if exclude_keywords:
+        for keyword in exclude_keywords:
+            k = keyword.lower()
+            if k and k in text_blob:
+                score -= 4
+
+    tag = str(element.get("tagName") or "").lower()
+    if tag in {"button", "a"}:
+        score += 2
+    elif tag in {"input", "label"}:
+        score += 1
+
+    rect = element.get("rect") or {}
+    top = rect.get("top", rect.get("y", 9999))
+    if isinstance(top, (int, float)):
+        if top <= 180:
+            score += 2
+        elif top >= 300:
+            score -= 1
+    return score
+
+
+async def _click_dom_element_by_keywords(
+    *,
+    include_keywords: list[str],
+    exclude_keywords: Optional[list[str]] = None,
+    require_enabled: bool = False,
+    min_top: Optional[float] = None,
+    max_top: Optional[float] = None,
+    top_n: int = 3,
+) -> bool:
+    dom_result = await executor.mark_page_elements()
+    elements = dom_result.get("elements", [])
+    if not elements:
+        return False
+
+    ranked: list[tuple[int, dict]] = []
+    for element in elements:
+        rect = element.get("rect") or {}
+        top = rect.get("top", rect.get("y"))
+        if isinstance(top, (int, float)):
+            if min_top is not None and top < min_top:
+                continue
+            if max_top is not None and top > max_top:
+                continue
+
+        score = _match_element_score(element, include_keywords, exclude_keywords)
+        if score <= 0:
+            continue
+        if require_enabled and not _is_element_enabled_for_action(element):
+            continue
+        ranked.append((score, element))
+
+    if not ranked:
+        return False
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    for _, element in ranked[:max(1, top_n)]:
+        element_id = element.get("id")
+        if not element_id:
+            continue
+        clicked = await executor.click_element_by_id(element_id)
+        if clicked:
+            return True
+
+    return False
+
+
+async def _wait_filter_result_ready(timeout_ms: int = 12000) -> bool:
+    """等待页面出现筛选结果条（如：已选择筛选结果中 N 条数据）。"""
+    await executor._ensure_page()
+    page = executor._page
+    ready_script = """
+    () => {
+      const text = (document.body?.innerText || '').replace(/\s+/g, ' ');
+      return /已选择筛选结果中\s*\d+\s*条数据/.test(text) || /已选择\s*\d+\s*条数据/.test(text);
+    }
+    """
+
+    try:
+        await page.wait_for_function(ready_script, timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+async def _click_top_control_by_keywords(
+    *,
+    include_keywords: list[str],
+    exclude_keywords: Optional[list[str]] = None,
+    require_enabled: bool = True,
+    top_n: int = 3,
+) -> bool:
+    return await _click_dom_element_by_keywords(
+        include_keywords=include_keywords,
+        exclude_keywords=exclude_keywords,
+        require_enabled=require_enabled,
+        min_top=0,
+        max_top=160,
+        top_n=top_n,
+    )
+
+
+async def _click_top_image_download_button() -> bool:
+    await executor._ensure_page()
+    page = executor._page
+    locator_candidates = [
+        page.locator(".filters .el-dropdown .el-button", has_text="图片下载").first,
+        page.locator(".filters .el-dropdown", has_text="图片下载").first,
+        page.locator(".filters button", has_text="图片下载").first,
+        page.locator("button", has_text="图片下载").first,
+        page.get_by_text("图片下载", exact=True).first,
+    ]
+
+    for locator in locator_candidates:
+        try:
+            await locator.wait_for(state="visible", timeout=1200)
+            try:
+                enabled = await locator.evaluate(
+                    """
+                    (el) => {
+                      const cls = (el.className || '').toString().toLowerCase();
+                      const txt = ((el.innerText || '') + ' ' + (el.value || '')).toLowerCase();
+                      if (el.disabled) return false;
+                      if (cls.includes('is-disabled') || cls.includes('disabled')) return false;
+                      if (txt.includes('disabled')) return false;
+                      return true;
+                    }
+                    """
+                )
+                if not enabled:
+                    continue
+            except Exception:
+                pass
+            await locator.click(timeout=1500)
+            return True
+        except Exception:
+            continue
+
+    if await _click_top_control_by_keywords(
+        include_keywords=["图片下载"],
+        exclude_keywords=["视频"],
+        require_enabled=True,
+        top_n=2,
+    ):
+        return True
+    return False
+
+
+async def _open_top_image_download_dropdown() -> bool:
+    clicked = await _click_top_image_download_button()
+    if clicked:
+        await asyncio.sleep(0.35)
+    return clicked
+
+
+async def _click_image_download_menu_item(
+    item_texts: list[str],
+    timeout_ms: int = 5000,
+) -> bool:
+    await executor._ensure_page()
+    page = executor._page
+
+    attempts = max(2, int(timeout_ms / 300))
+
+    for _ in range(attempts):
+        for text in item_texts:
+            try:
+                item_locator = page.locator(".el-dropdown-menu__item", has_text=text)
+                count = await item_locator.count()
+                for idx in range(min(count, 12)):
+                    candidate = item_locator.nth(idx)
+                    try:
+                        if not await candidate.is_visible():
+                            continue
+                        await candidate.click(timeout=1200)
+                        return True
+                    except Exception:
+                        try:
+                            await candidate.click(timeout=1200, force=True)
+                            return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            candidates = [
+                page.locator(".el-popper .el-dropdown-menu__item", has_text=text),
+                page.locator(".el-dropdown-menu__item", has_text=text),
+                page.locator("[role='menuitem']", has_text=text),
+                page.locator("li", has_text=text),
+            ]
+            for locator in candidates:
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+                for idx in range(min(count, 8)):
+                    node = locator.nth(idx)
+                    try:
+                        if not await node.is_visible():
+                            continue
+                        await node.click(timeout=1000)
+                        return True
+                    except Exception:
+                        try:
+                            await node.click(timeout=1000, force=True)
+                            return True
+                        except Exception:
+                            continue
+
+        clicked = await page.evaluate(
+            """
+            (texts) => {
+              const normalize = (s) => String(s || '').replace(/\s+/g, '').toLowerCase();
+              const wanted = (texts || []).map(normalize).filter(Boolean);
+              if (!wanted.length) return false;
+
+              const isVisible = (el) => {
+                if (!el) return false;
+                const s = getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+              };
+
+              const containers = Array.from(document.querySelectorAll('.el-popper, .el-popover, .el-dropdown-menu'))
+                .filter(el => isVisible(el))
+                .filter(el => {
+                  const r = el.getBoundingClientRect();
+                  return r.top >= 0 && r.top <= 360;
+                })
+                .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+              for (const container of containers) {
+                const items = Array.from(container.querySelectorAll('.el-dropdown-menu__item, li, span, div'));
+                for (const item of items) {
+                  if (!isVisible(item)) continue;
+                  const txt = normalize(item.innerText || item.textContent || '');
+                  if (!txt) continue;
+                  if (wanted.some(w => txt === w || txt.includes(w))) {
+                    item.click();
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }
+            """,
+            item_texts,
+        )
+        if clicked:
+            return True
+
+        await asyncio.sleep(0.2)
+
+    return False
+
+
+async def _download_zip_via_top_image_controls(save_path: str, timeout_ms: int = 60000) -> str:
+    """通过顶部“图片下载”菜单下载原始图片 zip。
+
+    路径 A：点击“原始图片”菜单项即触发下载。
+    路径 B：菜单项仅切换模式，再点击一次顶部“图片下载”触发下载。
+    """
+    await executor._ensure_page()
+    page = executor._page
+
+    try:
+        history_seed_url = page.url or os.getenv("STEEL_TARGET_URL", "")
+        current_url, redirected = await _ensure_active_history_page(history_seed_url)
+        if redirected:
+            logger.info(f"Adjusted active page before opening image menu: {current_url}")
+        await executor.wait_for_load(timeout_ms=10000)
+        await executor.wait_for_stable(1000)
+        page = executor._page
+    except Exception as exc:
+        logger.warning(f"Failed to stabilize active page before opening image menu: {exc}")
+
+    mode_selected = False
+
+    opened = await _open_top_image_download_dropdown()
+    if not opened:
+        raise RuntimeError("未能打开顶部“图片下载”菜单")
+
+    direct_timeout = min(timeout_ms, 18000)
+    try:
+        async with page.expect_download(timeout=direct_timeout) as download_info:
+            mode_selected = await _click_image_download_menu_item(["原始图片", "原图"], timeout_ms=5000)
+            if not mode_selected:
+                raise RuntimeError("未找到“原始图片”菜单项")
+        download = await download_info.value
+        await download.save_as(save_path)
+        return save_path
+    except Exception as exc:
+        logger.info(f"Menu-direct zip download not triggered, fallback to second-click path: {exc}")
+
+    if not mode_selected:
+        opened = await _open_top_image_download_dropdown()
+        if not opened:
+            raise RuntimeError("下载失败：无法重新打开“图片下载”菜单")
+        mode_selected = await _click_image_download_menu_item(["原始图片", "原图"], timeout_ms=5000)
+        if not mode_selected:
+            raise RuntimeError("下载失败：未找到“原始图片”菜单项")
+
+    await asyncio.sleep(0.3)
+    async with page.expect_download(timeout=timeout_ms) as download_info:
+        clicked = await _click_top_image_download_button()
+        if not clicked:
+            raise RuntimeError("下载失败：未能点击顶部“图片下载”按钮触发下载")
+
+    download = await download_info.value
+    await download.save_as(save_path)
+    return save_path
+
+
+async def _select_first_table_row_for_export() -> bool:
+    await executor._ensure_page()
+    page = executor._page
+
+    script = """
+    () => {
+      const table = document.querySelector('.el-table__body-wrapper');
+      if (!table) return { ok: false, reason: 'table_not_found' };
+
+      const checked = table.querySelector('.el-checkbox__input.is-checked');
+      if (checked) return { ok: true, mode: 'already_checked' };
+
+      const firstInner = table.querySelector('.el-checkbox__inner');
+      if (!firstInner) return { ok: false, reason: 'checkbox_not_found' };
+
+      firstInner.click();
+      return { ok: true, mode: 'click_first_checkbox' };
+    }
+    """
+
+    result = await page.evaluate(script)
+    if bool(result.get("ok", False)):
+        return True
+
+    # DOM 注入兜底：尝试点击与 checkbox 相关的可交互元素
+    clicked = await _click_dom_element_by_keywords(
+        include_keywords=["checkbox", "el-checkbox"],
+        exclude_keywords=["header"],
+        require_enabled=False,
+        top_n=6,
+    )
+    if clicked:
+        await asyncio.sleep(0.4)
+        return True
+
+    # 页面点击兜底：第一行左侧近似坐标
+    fallback = await page.evaluate(
+        """
+        () => {
+          const table = document.querySelector('.el-table__body-wrapper');
+          if (!table) return false;
+          const rect = table.getBoundingClientRect();
+          const x = Math.round(rect.left + 18);
+          const y = Math.round(rect.top + 24);
+          const el = document.elementFromPoint(x, y);
+          if (!el) return false;
+          el.click();
+          return true;
+        }
+        """
+    )
+    return bool(fallback)
+
+
+async def _click_download_by_dom(
+    *,
+    include_keywords: list[str],
+    save_path: str,
+    exclude_keywords: Optional[list[str]] = None,
+    timeout_ms: int = 60000,
+) -> str:
+    await executor._ensure_page()
+    page = executor._page
+
+    async with page.expect_download(timeout=timeout_ms) as download_info:
+        clicked = await _click_dom_element_by_keywords(
+            include_keywords=include_keywords,
+            exclude_keywords=exclude_keywords,
+            require_enabled=True,
+            top_n=5,
+        )
+        if not clicked:
+            raise RuntimeError(f"Failed to click DOM download trigger: {include_keywords}")
+
+    download = await download_info.value
+    await download.save_as(save_path)
+    return save_path
+
+
+async def _click_preferred_download_button(kind: str, save_path: str, timeout_ms: int = 60000) -> str:
+    kind_lower = (kind or "").lower()
+    if kind_lower == "excel":
+        await executor._ensure_page()
+        page = executor._page
+        async with page.expect_download(timeout=timeout_ms) as download_info:
+            clicked = await _click_top_control_by_keywords(
+                include_keywords=["数据导出", "导出", "excel"],
+                exclude_keywords=["视频", "图片"],
+                require_enabled=True,
+                top_n=3,
+            )
+            if not clicked:
+                clicked = await _click_dom_element_by_keywords(
+                    include_keywords=["数据导出", "导出", "excel"],
+                    exclude_keywords=["视频", "图片"],
+                    require_enabled=True,
+                    top_n=5,
+                )
+            if not clicked:
+                raise RuntimeError("未找到可点击的数据导出按钮")
+
+        download = await download_info.value
+        await download.save_as(save_path)
+        return save_path
+
+    return await _download_zip_via_top_image_controls(save_path=save_path, timeout_ms=timeout_ms)
+
+
+async def _run_steel_download_pipeline(
+    *,
+    task: str,
+    target_url: str,
+    max_items: int,
+    max_pages: int,
+    auth_data_file: Optional[str] = None,
+    stream_callback=None,
+) -> dict:
+    start_date, end_date = _extract_date_range(task)
+
+    async def emit(payload: dict) -> None:
+        if stream_callback:
+            maybe_awaitable = stream_callback(payload)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+
+    output_timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(OUTPUT_DIR, f"steel_{output_timestamp}")
+    ensure_dir(output_dir)
+
+    raw_excel_path = os.path.join(output_dir, "raw_export.xlsx")
+    raw_zip_path = os.path.join(output_dir, "raw_images.zip")
+    unzip_dir = os.path.join(output_dir, "unzipped")
+    final_excel_path = os.path.join(output_dir, f"steel_with_images_{output_timestamp}.xlsx")
+
+    try:
+        auth_path = await _apply_auth_data_if_available(target_url=target_url, auth_data_file=auth_data_file)
+        if auth_path:
+            await emit({"type": "steel_stage", "stage": "auth", "message": f"已加载登录态: {os.path.basename(auth_path)}"})
+
+        await emit({"type": "steel_stage", "stage": "navigation", "message": f"打开目标站点: {target_url}"})
+        await executor.goto(target_url)
+        await executor.wait_for_load()
+        await executor.wait_for_stable(2000)
+        try:
+            current_route = await executor.get_url()
+        except Exception:
+            current_route = ""
+
+        if _is_login_route(current_route):
+            await emit({"type": "steel_stage", "stage": "auth", "message": "检测到登录页，尝试自动恢复登录态"})
+            await _apply_auth_data_if_available(target_url=target_url, auth_data_file=auth_data_file)
+            await executor.goto(_build_history_url(target_url))
+            await executor.wait_for_load()
+            await executor.wait_for_stable(1800)
+            current_route = await executor.get_url()
+            if _is_login_route(current_route):
+                raise RuntimeError("钢铁站点登录态失效：当前仍在登录页，请更新 cookies/auth_data 文件后重试。")
+
+        current_url, redirected = await _ensure_history_page(target_url)
+        if redirected:
+            await emit({"type": "steel_stage", "stage": "navigation", "message": f"检测到路由偏移，已返回历史记录页: {current_url}"})
+
+        await emit({"type": "steel_stage", "stage": "date", "message": f"设置日期范围: {start_date} ~ {end_date}"})
+        current_url, redirected = await _ensure_history_page(target_url)
+        if redirected:
+            await emit({"type": "steel_stage", "stage": "navigation", "message": f"设置日期前已纠偏至历史记录页: {current_url}"})
+        await _set_date_inputs(start_date, end_date)
+        await asyncio.sleep(1)
+        current_url, redirected = await _ensure_history_page(target_url)
+        if redirected:
+            await emit({"type": "steel_stage", "stage": "navigation", "message": f"日期设置后发生跳页，已返回历史记录页并重设日期: {current_url}"})
+            await _set_date_inputs(start_date, end_date)
+            await asyncio.sleep(1)
+
+        await emit({"type": "steel_stage", "stage": "filter", "message": "筛选打包状态=异常"})
+        current_url, redirected = await _ensure_history_page(target_url)
+        if redirected:
+            await emit({"type": "steel_stage", "stage": "navigation", "message": f"筛选前已纠偏至历史记录页: {current_url}"})
+        selected = await _select_abnormal_status()
+        if not selected:
+            raise RuntimeError("未能在历史记录页找到“打包状态=异常”筛选控件")
+        await asyncio.sleep(1)
+
+        await emit({"type": "steel_stage", "stage": "wait_ready", "message": "等待筛选结果就绪（已选择 N 条数据）"})
+        ready = await _wait_filter_result_ready(timeout_ms=12000)
+        if not ready:
+            await emit({"type": "steel_stage", "stage": "wait_ready", "message": "未检测到筛选结果提示，继续尝试下载"})
+        await asyncio.sleep(0.6)
+
+        await emit({"type": "steel_stage", "stage": "download_excel", "message": "下载异常数据 Excel"})
+        await _click_preferred_download_button("excel", raw_excel_path)
+        if not os.path.exists(raw_excel_path) or os.path.getsize(raw_excel_path) <= 0:
+            raise RuntimeError("Excel 下载失败或文件为空")
+
+        await emit({"type": "steel_stage", "stage": "download_zip", "message": "下载原始图片压缩包"})
+        zip_downloaded = False
+        zip_error: Optional[Exception] = None
+
+        for attempt in range(2):
+            try:
+                if attempt == 1:
+                    await emit({"type": "steel_stage", "stage": "download_zip_retry", "message": "同页面重试图片下载"})
+                await _click_preferred_download_button("zip", raw_zip_path)
+                zip_downloaded = True
+                break
+            except Exception as zip_exc:
+                zip_error = zip_exc
+                logger.warning(f"Zip download attempt {attempt + 1}/2 failed on current page: {zip_exc}")
+                await asyncio.sleep(0.8)
+
+        if not zip_downloaded:
+            await emit({"type": "steel_stage", "stage": "recover", "message": f"图片下载失败，尝试恢复并重试: {zip_error}"})
+
+            await _apply_auth_data_if_available(target_url=target_url, auth_data_file=auth_data_file)
+            await executor.goto(_build_history_url(target_url))
+            await executor.wait_for_load()
+            await executor.wait_for_stable(1500)
+
+            await _set_date_inputs(start_date, end_date)
+            await asyncio.sleep(0.8)
+            recovered_selected = await _select_abnormal_status()
+            if not recovered_selected:
+                raise RuntimeError("恢复后仍无法设置打包状态=异常")
+            await asyncio.sleep(0.8)
+            await _wait_filter_result_ready(timeout_ms=10000)
+
+            await _click_preferred_download_button("zip", raw_zip_path)
+        if not os.path.exists(raw_zip_path) or os.path.getsize(raw_zip_path) <= 0:
+            raise RuntimeError("图片 zip 下载失败或文件为空")
+
+        await emit({"type": "steel_stage", "stage": "unzip", "message": "解压图片文件"})
+        _unzip_file(raw_zip_path, unzip_dir)
+        picture_root = _find_picture_root(unzip_dir)
+        if not picture_root:
+            raise RuntimeError("解压后未找到图片目录")
+
+        await emit({"type": "steel_stage", "stage": "embed", "message": "生成带图 Excel"})
+        final_output = generate_excel_with_embedded_images(
+            excel_path=raw_excel_path,
+            images_dir=picture_root,
+            output_path=final_excel_path,
+            reverse_mapping=True,
+            column_name="原始图片",
+            image_width=160,
+            image_height=120,
+        )
+
+        final_file_name = os.path.basename(str(final_output))
+        if str(final_output).startswith(output_dir):
+            # 拷贝到可下载目录
+            publish_path = os.path.join(OUTPUT_DIR, final_file_name)
+            shutil.copy2(final_output, publish_path)
+            final_output = publish_path
+
+        await emit({"type": "steel_stage", "stage": "done", "message": "钢铁任务完成"})
+
+        return {
+            "status": "success",
+            "final_excel": os.path.basename(str(final_output)),
+            "raw_excel": os.path.basename(raw_excel_path),
+            "raw_zip": os.path.basename(raw_zip_path),
+            "picture_dir": picture_root,
+            "date_range": {"start": start_date, "end": end_date},
+            "reasoning": "Steel pipeline completed successfully",
+        }
+    except Exception as exc:
+        logger.exception(f"Steel pipeline failed: {exc}")
+        await emit({"type": "steel_stage", "stage": "failed", "message": str(exc)})
+        return {
+            "status": "failed",
+            "final_excel": None,
+            "raw_excel": os.path.basename(raw_excel_path) if os.path.exists(raw_excel_path) else None,
+            "raw_zip": os.path.basename(raw_zip_path) if os.path.exists(raw_zip_path) else None,
+            "picture_dir": None,
+            "date_range": {"start": start_date, "end": end_date},
+            "reasoning": str(exc),
+        }
 
 
 def _finish_check(task: str, parse_resp: ParseResponse, current_url: str) -> Optional[dict]:
@@ -996,6 +2197,8 @@ async def run_with_reflection(request: dict) -> dict:
 @app.get("/run_task_stream")
 async def run_task_stream(
     task: str,
+    target_url: Optional[str] = None,
+    auth_data_file: Optional[str] = None,
     max_steps: int = 20,
     max_retries_per_step: int = 3,
     list_only: bool = False,
@@ -1008,6 +2211,62 @@ async def run_task_stream(
 
     async def event_generator():
         try:
+            if _is_steel_inspection_task(task):
+                yield f"data: {json.dumps({'type': 'start', 'task': task})}\n\n"
+
+                event_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+                async def _callback(payload: dict):
+                    normalized = payload if isinstance(payload, dict) else {"type": "steel_stage", "message": str(payload)}
+                    await event_queue.put(f"data: {json.dumps(normalized)}\n\n")
+
+                resolved_auth_data = _resolve_auth_data_file(
+                    auth_data_file=auth_data_file or _extract_auth_data_path_from_task(task),
+                    target_url=target_url,
+                )
+                steel_target_url = _extract_target_url(task, target_url)
+                if not steel_target_url:
+                    steel_target_url = _extract_target_url_from_auth_data(
+                        auth_data_file=resolved_auth_data,
+                        fallback_url=target_url,
+                    )
+                if not steel_target_url:
+                    raise RuntimeError("钢铁任务缺少目标网址：请在任务中包含 http(s) 链接，或提供可读的 cookies/auth_data 文件。")
+
+                pipeline_task = asyncio.create_task(
+                    _run_steel_download_pipeline(
+                        task=task,
+                        target_url=steel_target_url,
+                        max_items=max_items,
+                        max_pages=max_pages,
+                        auth_data_file=resolved_auth_data,
+                        stream_callback=_callback,
+                    )
+                )
+
+                while True:
+                    if pipeline_task.done() and event_queue.empty():
+                        break
+                    try:
+                        line = await asyncio.wait_for(event_queue.get(), timeout=0.2)
+                        if line:
+                            yield line
+                    except asyncio.TimeoutError:
+                        continue
+
+                steel_result = await pipeline_task
+
+                done_status = steel_result.get("status", "failed")
+                reasoning = steel_result.get("reasoning", "")
+                excel_file = steel_result.get("final_excel")
+                try:
+                    final_url = await executor.get_url()
+                except Exception as url_exc:
+                    logger.warning(f"Failed to get final URL in steel stream done event: {url_exc}")
+                    final_url = _build_history_url(steel_target_url)
+                yield f"data: {json.dumps({'type': 'done', 'status': done_status, 'reasoning': reasoning, 'user_message': None if done_status == 'success' else reasoning, 'final_url': final_url, 'extracted_items': [], 'excel_file': excel_file, 'steel_result': steel_result})}\n\n"
+                return
+
             vlm = VLMService()
             engine = ReflectionEngine(
                 executor=executor,
@@ -1057,6 +2316,7 @@ async def run_task_stream(
             # 数据提取
             extracted_items = []
             excel_file = None
+            seen_item_keys: set[str] = set()
 
             terminated_step = next((step for step in reversed(all_steps) if step.get("status") == "terminated"), None)
 
@@ -1101,6 +2361,16 @@ async def run_task_stream(
                     items = extracted_data.get("items", []) if isinstance(extracted_data, dict) else []
                     logger.info(f"Extracted {len(items)} items from list page")
 
+                    unique_items: list[dict] = []
+                    for item in items:
+                        item_key = _build_extracted_item_key(item)
+                        if item_key and item_key in seen_item_keys:
+                            continue
+                        unique_items.append(item)
+                    if len(unique_items) != len(items):
+                        logger.info(f"Deduplicated list items: {len(items)} -> {len(unique_items)}")
+                    items = unique_items
+
                     remaining_slots = max(0, target_items - len(extracted_items))
                     items_to_process = items[:remaining_slots]
 
@@ -1123,61 +2393,95 @@ async def run_task_stream(
                                             detail_url = urljoin(list_page_url, href) if href.startswith("/") else href
                                         break
 
-                            try:
-                                navigated = False
+                            detail_success = False
+                            last_detail_error: Optional[Exception] = None
+                            candidate_item: Optional[dict] = None
 
-                                if detail_url:
-                                    if isinstance(detail_url, str) and detail_url.startswith("/"):
-                                        detail_url = urljoin(list_page_url, detail_url)
-                                    logger.info(f"Navigating to detail page by URL: {detail_url}")
-                                    await executor.goto(detail_url)
-                                    navigated = True
-                                elif detail_element_id:
-                                    logger.info(f"Navigating to detail page by element_id: {detail_element_id}")
-                                    click_success = await executor.click_element_by_id(detail_element_id)
-                                    if not click_success:
-                                        raise RuntimeError(f"Failed to click detail element {detail_element_id}")
-                                    navigated = True
+                            for attempt in range(1, 4):
+                                try:
+                                    if attempt > 1:
+                                        logger.info(f"Retrying detail extraction ({attempt}/3)")
+                                        await executor.goto(list_page_url)
+                                        await asyncio.sleep(0.6)
+                                        await executor.wait_for_stable(600)
 
-                                if not navigated:
-                                    cleaned_item = _prepare_extracted_item(item, requested_fields)
-                                    extracted_items.append(cleaned_item if cleaned_item else item)
-                                    yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
-                                    continue
+                                    navigated = False
 
-                                await asyncio.sleep(1)
-                                await executor.wait_for_stable(1000)
+                                    if detail_url:
+                                        if isinstance(detail_url, str) and detail_url.startswith("/"):
+                                            detail_url = urljoin(list_page_url, detail_url)
+                                        logger.info(f"Navigating to detail page by URL: {detail_url} (attempt {attempt}/3)")
+                                        await executor.goto(detail_url)
+                                        navigated = True
+                                    elif detail_element_id:
+                                        logger.info(f"Navigating to detail page by element_id: {detail_element_id} (attempt {attempt}/3)")
+                                        click_success = await executor.click_element_by_id(detail_element_id)
+                                        if not click_success:
+                                            raise RuntimeError(f"Failed to click detail element {detail_element_id}")
+                                        navigated = True
 
-                                detail_screenshot = os.path.join(DATA_DIR, f"detail_{len(extracted_items)}.png")
-                                await executor.screenshot(detail_screenshot)
+                                    if not navigated:
+                                        raise RuntimeError("No detail navigation target available")
 
-                                with open(detail_screenshot, "rb") as f:
-                                    detail_image_b64 = base64.b64encode(f.read()).decode("ascii")
+                                    await asyncio.sleep(1)
+                                    await executor.wait_for_stable(1000)
 
-                                detail_current_url = await executor.get_url()
-                                detail_data, _ = planner.extract_from_page(
-                                    task=task,
-                                    mode="detail",
-                                    annotated_image_base64=detail_image_b64,
-                                    current_url=detail_current_url
-                                )
+                                    detail_screenshot = os.path.join(DATA_DIR, f"detail_{len(extracted_items)}_{attempt}.png")
+                                    await executor.screenshot(detail_screenshot)
 
-                                detail_fields = detail_data.get("data", {}) if isinstance(detail_data, dict) else {}
-                                merged_item = {**item, **detail_fields}
-                                cleaned_item = _prepare_extracted_item(merged_item, requested_fields)
-                                extracted_items.append(cleaned_item if cleaned_item else merged_item)
+                                    with open(detail_screenshot, "rb") as f:
+                                        detail_image_b64 = base64.b64encode(f.read()).decode("ascii")
 
-                            except Exception as e:
-                                logger.error(f"Failed to extract detail page: {e}")
+                                    detail_current_url = await executor.get_url()
+                                    detail_data, _ = planner.extract_from_page(
+                                        task=task,
+                                        mode="detail",
+                                        annotated_image_base64=detail_image_b64,
+                                        current_url=detail_current_url
+                                    )
+
+                                    detail_fields = detail_data.get("data", {}) if isinstance(detail_data, dict) else {}
+                                    if not detail_fields:
+                                        raise RuntimeError("Detail extraction returned empty fields")
+
+                                    merged_item = {**item, **detail_fields}
+                                    cleaned_item = _prepare_extracted_item(merged_item, requested_fields)
+                                    candidate_item = cleaned_item if cleaned_item else merged_item
+                                    detail_success = True
+                                    break
+
+                                except Exception as e:
+                                    last_detail_error = e
+                                    logger.warning(f"Detail extraction attempt {attempt}/3 failed: {e}")
+
+                            if not detail_success:
+                                logger.error(f"Failed to extract detail page after 3 retries, fallback to list item: {last_detail_error}")
                                 cleaned_item = _prepare_extracted_item(item, requested_fields)
-                                extracted_items.append(cleaned_item if cleaned_item else item)
-                            finally:
+                                candidate_item = cleaned_item if cleaned_item else item
+
+                            if candidate_item is None:
+                                candidate_item = item
+
+                            dedup_key = _build_extracted_item_key(candidate_item)
+                            if dedup_key and dedup_key in seen_item_keys:
+                                logger.info(f"Skip duplicated extracted item in detail branch: {dedup_key}")
+                            else:
+                                extracted_items.append(candidate_item)
+                                if dedup_key:
+                                    seen_item_keys.add(dedup_key)
+
+                            try:
+                                await executor.go_back()
+                                await asyncio.sleep(0.8)
+                                await executor.wait_for_stable(500)
+                            except Exception as back_error:
+                                logger.warning(f"go_back failed after detail extraction, fallback to goto: {back_error}")
                                 try:
                                     await executor.goto(list_page_url)
                                     await asyncio.sleep(1)
                                     await executor.wait_for_stable(500)
-                                except Exception as back_error:
-                                    logger.warning(f"Failed to navigate back to list page: {back_error}")
+                                except Exception as goto_back_error:
+                                    logger.warning(f"Failed to navigate back to list page: {goto_back_error}")
 
                             yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
                     else:
@@ -1186,7 +2490,13 @@ async def run_task_stream(
                             if len(extracted_items) >= target_items:
                                 break
                             cleaned_item = _prepare_extracted_item(item, requested_fields)
-                            extracted_items.append(cleaned_item if cleaned_item else item)
+                            final_item = cleaned_item if cleaned_item else item
+                            dedup_key = _build_extracted_item_key(final_item)
+                            if dedup_key and dedup_key in seen_item_keys:
+                                continue
+                            extracted_items.append(final_item)
+                            if dedup_key:
+                                seen_item_keys.add(dedup_key)
                         yield f"data: {json.dumps({'type': 'extract_progress', 'count': len(extracted_items)})}\n\n"
 
                     pages_processed += 1
@@ -1194,8 +2504,25 @@ async def run_task_stream(
                     if len(extracted_items) >= target_items:
                         break
 
-                    # 检查是否需要翻页
-                    next_action = extracted_data.get("next", "stop")
+                    # 检查是否需要翻页/滚动
+                    next_action_raw = str(extracted_data.get("next", "stop") or "stop").strip().lower()
+                    if next_action_raw in {"next page", "nextpage", "next"}:
+                        next_action = "next_page"
+                    elif next_action_raw in {"scroll", "scroll_down", "scroll down"}:
+                        next_action = "scroll"
+                    else:
+                        next_action = next_action_raw
+
+                    should_try_scroll = (
+                        next_action == "scroll"
+                        or (next_action in {"stop", "", "continue", "more"} and len(extracted_items) < target_items)
+                    )
+
+                    logger.info(
+                        f"Pagination decision: action={next_action_raw}->{next_action}, "
+                        f"collected={len(extracted_items)}/{target_items}, page={pages_processed}/{max_pages}"
+                    )
+
                     if next_action == "next_page":
                         next_page_element_id = extracted_data.get("next_page_element_id")
                         paged = False
@@ -1223,6 +2550,21 @@ async def run_task_stream(
                         if not paged:
                             logger.info("No further pagination available, stop extraction")
                             break
+                    elif should_try_scroll:
+                        paged = False
+                        try:
+                            scroll_y = await executor.scroll_to_next_page(need_overlap=True)
+                            paged = bool(scroll_y and scroll_y > 0)
+                            if paged:
+                                await asyncio.sleep(1)
+                                await executor.wait_for_stable(800)
+                        except Exception as scroll_error:
+                            logger.warning(f"Scroll pagination failed: {scroll_error}")
+                            paged = False
+
+                        if not paged:
+                            logger.info("Scroll did not advance page, stop extraction")
+                            break
                     else:
                         break
 
@@ -1237,7 +2579,11 @@ async def run_task_stream(
                     yield f"data: {json.dumps({'type': 'extract_done', 'count': len(extracted_items), 'file': excel_file})}\n\n"
 
             # 发送完成事件
-            final_url = await executor.get_url()
+            try:
+                final_url = await executor.get_url()
+            except Exception as url_exc:
+                logger.warning(f"Failed to get final URL in stream done event: {url_exc}")
+                final_url = ""
             if terminated_step:
                 done_status = "terminated"
                 done_reasoning = terminated_step.get("termination_reason") or terminated_step.get("verification", {}).get("reasoning", "")
@@ -1310,6 +2656,57 @@ async def run_task(request: dict) -> dict:
         raise HTTPException(status_code=400, detail="task is required")
 
     logger.info(f"Starting unified task: {task}")
+
+    if _is_steel_inspection_task(task):
+        resolved_auth_data = _resolve_auth_data_file(
+            auth_data_file=request.get("auth_data_file") or _extract_auth_data_path_from_task(task),
+            target_url=request.get("target_url"),
+        )
+
+        target_url = _extract_target_url(task, request.get("target_url"))
+        if not target_url:
+            target_url = _extract_target_url_from_auth_data(
+                auth_data_file=resolved_auth_data,
+                fallback_url=request.get("target_url"),
+            )
+        if not target_url:
+            return {
+                "status": "failed",
+                "steps": [],
+                "extracted_items": [],
+                "excel_file": None,
+                "termination_reason": "missing_target_url",
+                "user_message": "钢铁任务缺少目标网址：请在任务文本中包含 http(s) 链接，或提供可读的 cookies/auth_data 文件。",
+                "final_url": await executor.get_url(),
+                "reasoning": "missing target url",
+                "plan": [],
+                "steel_result": None,
+            }
+
+        steel_result = await _run_steel_download_pipeline(
+            task=task,
+            target_url=target_url,
+            max_items=max_items,
+            max_pages=max_pages,
+            auth_data_file=resolved_auth_data,
+        )
+
+        done_status = steel_result.get("status", "failed")
+        done_reasoning = steel_result.get("reasoning", "")
+        done_excel = steel_result.get("final_excel")
+
+        return {
+            "status": "success" if done_status == "success" else "failed",
+            "steps": [],
+            "extracted_items": [],
+            "excel_file": done_excel,
+            "termination_reason": None if done_status == "success" else "steel_pipeline_failed",
+            "user_message": None if done_status == "success" else done_reasoning,
+            "final_url": await executor.get_url(),
+            "reasoning": done_reasoning,
+            "plan": [],
+            "steel_result": steel_result,
+        }
 
     # 初始化 VLM 服务
     if not hasattr(planner, '_vlm') or planner._vlm is None:

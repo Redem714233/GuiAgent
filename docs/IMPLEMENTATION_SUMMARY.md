@@ -269,5 +269,4 @@ python examples/douban_with_login.py
 
 **实现时间**: 2026-02-09
 **版本**: v3.1
-**作者**: Claude Code
 **参考**: Skyvern

@@ -248,4 +248,3 @@ Items extracted: 2
 - **API**：设置 `use_reflection: true`
 - **测试**：`python test/test_extraction_with_reflection.py`
 
-现在你的 Extract Data 模式有了 Skyvern 风格的反思机制，翻页更可靠了！🚀

@@ -753,18 +753,39 @@ class Executor:
             当前滚动位置
         """
         await self._ensure_page()
-        try:
-            # 先注入 JavaScript
-            await self._page.evaluate(self.dom_service.dom_marker_js)
-            scroll_y = await self._page.evaluate(
-                "(needOverlap) => scrollToNextPage(needOverlap)",
-                need_overlap
-            )
-            logger.info(f"Scrolled to next page, current position: {scroll_y}")
-            return float(scroll_y)
-        except Exception as e:
-            logger.error(f"Failed to scroll to next page: {e}")
-            return 0.0
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 3):
+            try:
+                # 先注入 JavaScript
+                await self._page.evaluate(self.dom_service.dom_marker_js)
+                scroll_y = await self._page.evaluate(
+                    "(needOverlap) => scrollToNextPage(needOverlap)",
+                    need_overlap
+                )
+                logger.info(f"Scrolled to next page, current position: {scroll_y}")
+                return float(scroll_y)
+            except Exception as e:
+                last_error = e
+                err_text = str(e)
+                logger.error(f"Failed to scroll to next page (attempt {attempt}/2): {e}")
+
+                # 页面正在导航/上下文销毁时，等待加载稳定后重试一次
+                if attempt == 1 and (
+                    "Execution context was destroyed" in err_text
+                    or "Target page, context or browser has been closed" in err_text
+                ):
+                    try:
+                        await self.wait_for_load(timeout_ms=10000)
+                        await self.wait_for_stable(600)
+                        await self._ensure_page()
+                        continue
+                    except Exception as recover_error:
+                        logger.warning(f"Failed to recover page state before scroll retry: {recover_error}")
+                break
+
+        logger.error(f"Failed to scroll to next page after retries: {last_error}")
+        return 0.0
 
     async def is_at_page_bottom(self, threshold: int = 25) -> bool:
         """

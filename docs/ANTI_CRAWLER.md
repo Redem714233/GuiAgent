@@ -324,4 +324,3 @@ context_options = {
 
 **最后更新**: 2026-02-09
 **版本**: v3.1
-**作者**: Claude Code
