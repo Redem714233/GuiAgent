@@ -51,6 +51,42 @@ uvicorn backend.server:app --host 127.0.0.1 --port 8000 --reload
 - `GET /files/{filename}`
   - 下载导出文件
 
+- `GET /schedules`
+  - 获取定时任务列表（含 `next_run_at` / `last_run_at` / `last_status`）
+
+- `POST /schedules`
+  - 创建定时任务（支持每日定时或间隔分钟）
+
+- `PATCH /schedules/{job_id}`
+  - 更新定时任务（启停、时间、参数）
+
+- `DELETE /schedules/{job_id}`
+  - 删除定时任务
+
+- `POST /schedules/{job_id}/trigger`
+  - 手动触发一次定时任务
+
+## 并发与多实例
+
+- 后端已切换为“任务级会话隔离”，每次 `/run_task_stream` 与 `/run_task` 调用都会创建独立执行会话。
+- 可同时打开多个前端窗口并行执行不同任务，互不共享 Playwright 页面上下文。
+- 可选传参：
+  - `session_id`：业务侧自定义会话标识（便于日志追踪）。
+
+## 自然语言定时任务
+
+- 当任务文本包含定时语义（例如“每天8点采集昨天的数据”“每隔30分钟执行”），
+  `run_task_stream`/`run_task` 会优先创建 schedule，而不是立即执行。
+- 定时任务触发后会生成独立输出目录（时间命名），并在结果里记录 `output_dir`。
+
+## 后台静默运行
+
+- 调度器在 FastAPI `startup` 自动启动，在 `shutdown` 自动停止。
+- 因此后端作为常驻服务运行时，定时任务会持续生效并自动执行。
+- 相关环境变量：
+  - `SCHEDULE_TIMEZONE`（默认 `Asia/Shanghai`）
+  - `SCHEDULE_POLL_INTERVAL`（默认 `20` 秒）
+
 ## 环境变量
 
 请使用项目根目录的 `.env_temple` 作为模板创建 `.env`。

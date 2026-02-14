@@ -240,6 +240,293 @@ class VLMService:
         content = resp.choices[0].message.content or ""
         return self._extract_json(content), content
 
+    def extract_steel_task_intent(
+        self,
+        *,
+        task: str,
+        target_url: str | None = None,
+    ) -> tuple[Dict[str, Any], str]:
+        prompt = (
+            "You are a deterministic intent parser for browser automation. "
+            "Convert user natural language task into STRICT JSON decisions.\n\n"
+            "Return JSON only, using EXACT schema (always include all keys):\n"
+            "{\n"
+            "  \"target_url\": string | null,\n"
+            "  \"time_range\": {\"start\": \"YYYY-MM-DD HH:MM:SS\", \"end\": \"YYYY-MM-DD HH:MM:SS\"} | null,\n"
+            "  \"filters\": {\n"
+            "    \"apply_status_filter\": boolean,\n"
+            "    \"pack_status\": string | null\n"
+            "  },\n"
+            "  \"downloads\": {\n"
+            "    \"excel\": boolean,\n"
+            "    \"images\": {\n"
+            "      \"enabled\": boolean,\n"
+            "      \"modes\": [string]\n"
+            "    }\n"
+            "  },\n"
+            "  \"output\": {\"embed_images_to_excel\": boolean}\n"
+            "}\n\n"
+            "Hard rules:\n"
+            "1) Never omit keys. Never return comments.\n"
+            "2) If user says status filter is not needed, set apply_status_filter=false and pack_status=null.\n"
+            "3) If user says filter status=异常/正常, set apply_status_filter=true and pack_status exactly that label.\n"
+            "4) If user says do not download images, set downloads.images.enabled=false and modes=[].\n"
+            "5) If user says original+rendered, set modes=['original','rendered'] in that order.\n"
+            "6) If user gives site-specific image types, keep labels in modes as-is (e.g., '缩略图','标注图').\n"
+            "7) If user says do not create image-embedded excel, set output.embed_images_to_excel=false.\n"
+            "8) Convert Chinese time words (e.g., 下午四点) to 24h. If date only, use 00:00:00~23:59:59.\n"
+            "9) If info is truly missing: target_url=null, time_range=null, pack_status=null, modes=[].\n"
+        )
+        payload: Dict[str, Any] = {"task": task}
+        if target_url:
+            payload["target_url"] = target_url
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+        )
+        content = resp.choices[0].message.content or ""
+        parsed = self._extract_json(content)
+        return parsed if isinstance(parsed, dict) else {}, content
+
+    def order_filenames_from_page_state(
+        self,
+        *,
+        task: str,
+        mode_name: str,
+        page_state: Dict[str, Any],
+        candidate_filenames: list[str],
+    ) -> tuple[list[str], str]:
+        prompt = (
+            "You are a filename ordering planner for web automation output mapping. "
+            "Given page state summary and a list of downloaded image filenames, "
+            "return the most likely row-to-image filename order.\n\n"
+            "Return JSON only with key:\n"
+            "- ordered_filenames: list[string]\n\n"
+            "Rules:\n"
+            "- ordered_filenames must only contain items from candidate_filenames.\n"
+            "- Keep each filename at most once.\n"
+            "- Preserve best possible row order inferred from page_state (tables, controls, visible text).\n"
+            "- If uncertain, keep the original candidate_filenames order.\n"
+            "- Do not invent filenames not in candidates.\n"
+        )
+
+        payload: Dict[str, Any] = {
+            "task": task,
+            "mode_name": mode_name,
+            "candidate_filenames": candidate_filenames,
+            "page_state": page_state,
+        }
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content or ""
+        parsed = self._extract_json(content)
+        ordered = parsed.get("ordered_filenames") if isinstance(parsed, dict) else None
+        if not isinstance(ordered, list):
+            return [], content
+
+        candidate_set = {str(name).strip() for name in candidate_filenames if str(name).strip()}
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in ordered:
+            name = str(item).strip()
+            if not name or name in seen:
+                continue
+            if name not in candidate_set:
+                continue
+            seen.add(name)
+            result.append(name)
+        return result, content
+
+    def choose_dom_element_ids(
+        self,
+        *,
+        task: str,
+        objective: str,
+        elements: list[dict],
+        top_k: int = 3,
+    ) -> tuple[list[str], str]:
+        prompt = (
+            "You are a DOM element selector for browser automation. "
+            "Given a user task, a specific objective, and a list of interactive DOM elements, "
+            "return the best candidate element ids to click/type on.\n\n"
+            "Return JSON only with key:\n"
+            "- ids: list[string]\n\n"
+            "Rules:\n"
+            "- ids must come from provided elements only.\n"
+            "- Rank by relevance to objective first, then visibility/position hints in element data.\n"
+            "- Prefer direct action controls over navigation/sidebar links when objective is form interaction.\n"
+            "- Keep at most top_k ids.\n"
+            "- If uncertain, return an empty list.\n"
+        )
+
+        safe_top_k = max(1, int(top_k or 3))
+        compact_elements: list[dict[str, Any]] = []
+        for element in (elements or [])[:300]:
+            attrs = element.get("attributes") or {}
+            rect = element.get("rect") or {}
+            compact_elements.append(
+                {
+                    "id": element.get("id"),
+                    "tag": element.get("tagName"),
+                    "text": str(element.get("text") or "")[:120],
+                    "class": str(attrs.get("class") or "")[:120],
+                    "name": str(attrs.get("name") or "")[:80],
+                    "placeholder": str(attrs.get("placeholder") or "")[:120],
+                    "type": str(attrs.get("type") or "")[:40],
+                    "aria_label": str(attrs.get("aria-label") or "")[:120],
+                    "left": rect.get("left", rect.get("x")),
+                    "top": rect.get("top", rect.get("y")),
+                    "width": rect.get("width"),
+                    "height": rect.get("height"),
+                }
+            )
+
+        payload: Dict[str, Any] = {
+            "task": task,
+            "objective": objective,
+            "top_k": safe_top_k,
+            "elements": compact_elements,
+        }
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content or ""
+        parsed = self._extract_json(content)
+        raw_ids = parsed.get("ids") if isinstance(parsed, dict) else None
+        if not isinstance(raw_ids, list):
+            return [], content
+
+        valid_ids = {str(item.get("id") or "").strip() for item in compact_elements if str(item.get("id") or "").strip()}
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in raw_ids:
+            element_id = str(item).strip()
+            if not element_id or element_id in seen:
+                continue
+            if element_id not in valid_ids:
+                continue
+            seen.add(element_id)
+            result.append(element_id)
+            if len(result) >= safe_top_k:
+                break
+        return result, content
+
+    def next_action_from_page_state(
+        self,
+        *,
+        task: str,
+        objective: str,
+        page_state: Dict[str, Any],
+        elements: list[dict],
+        allowed_actions: list[str] | None = None,
+    ) -> tuple[Dict[str, Any], str]:
+        safe_allowed = allowed_actions or ["click_element", "wait", "noop"]
+        normalized_allowed = [str(item).strip() for item in safe_allowed if str(item).strip()]
+        if not normalized_allowed:
+            normalized_allowed = ["noop"]
+
+        compact_elements: list[dict[str, Any]] = []
+        for element in (elements or [])[:300]:
+            attrs = element.get("attributes") or {}
+            rect = element.get("rect") or {}
+            compact_elements.append(
+                {
+                    "id": str(element.get("id") or ""),
+                    "tag": str(element.get("tagName") or ""),
+                    "text": str(element.get("text") or "")[:120],
+                    "class": str(attrs.get("class") or "")[:120],
+                    "name": str(attrs.get("name") or "")[:80],
+                    "placeholder": str(attrs.get("placeholder") or "")[:120],
+                    "left": rect.get("left", rect.get("x")),
+                    "top": rect.get("top", rect.get("y")),
+                    "width": rect.get("width"),
+                    "height": rect.get("height"),
+                }
+            )
+
+        prompt = (
+            "You are a web-automation next-action planner. "
+            "Given objective + page_state + interactive elements, pick ONLY one next action.\n\n"
+            "Return JSON only with keys:\n"
+            "- action: one of allowed_actions\n"
+            "- element_id: string | null (required when action=click_element)\n"
+            "- ms: integer | null (required when action=wait)\n"
+            "- reasoning: short string\n\n"
+            "Rules:\n"
+            "- action must be in allowed_actions.\n"
+            "- element_id must come from provided elements only.\n"
+            "- If objective cannot be achieved confidently now, choose wait or noop.\n"
+            "- Do not output multiple actions.\n"
+        )
+
+        payload: Dict[str, Any] = {
+            "task": task,
+            "objective": objective,
+            "allowed_actions": normalized_allowed,
+            "page_state": page_state,
+            "elements": compact_elements,
+        }
+
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+        )
+
+        content = resp.choices[0].message.content or ""
+        parsed = self._extract_json(content)
+        if not isinstance(parsed, dict):
+            return {"action": "noop", "element_id": None, "ms": None, "reasoning": "invalid_response"}, content
+
+        action = str(parsed.get("action") or "noop").strip()
+        if action not in normalized_allowed:
+            action = "noop"
+
+        element_id = str(parsed.get("element_id") or "").strip() or None
+        valid_ids = {str(item.get("id") or "").strip() for item in compact_elements if str(item.get("id") or "").strip()}
+        if action == "click_element" and (not element_id or element_id not in valid_ids):
+            action = "noop"
+            element_id = None
+
+        ms_value = parsed.get("ms")
+        ms: int | None = None
+        if isinstance(ms_value, int):
+            ms = max(100, min(ms_value, 10000))
+
+        reasoning = str(parsed.get("reasoning") or "").strip()
+        result: Dict[str, Any] = {
+            "action": action,
+            "element_id": element_id,
+            "ms": ms,
+            "reasoning": reasoning,
+        }
+        return result, content
+
     def extract_from_page(
         self,
         *,
@@ -639,6 +926,7 @@ class VLMService:
             "- If step says 'go to page 3', success ONLY if URL shows page-3.html (NOT page-2.html)\n"
             "- If step says 'goto https://example.com', success ONLY if URL is exactly that URL (NOT about:blank)\n"
             "- If step says 'extract data', success if action is 'extract' (no browser action needed)\n"
+            "- If step says 'wait N seconds', success if wait action executed; page may remain unchanged\n"
             "- Partial progress is NOT success. Reaching page 2 when target is page 3 = FAILED\n\n"
 
             "Verification criteria:\n"

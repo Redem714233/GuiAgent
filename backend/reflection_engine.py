@@ -194,11 +194,35 @@ class ReflectionEngine:
             after_screenshot = await self._capture_screenshot()
             after_elements = await self._get_page_elements()
 
+            action_taken = str(action_result.get("action", "unknown") or "unknown")
+            is_wait_action = action_taken.lower().startswith("wait ")
+
+            if is_wait_action and action_result.get("success", False):
+                verification = {
+                    "success": True,
+                    "reasoning": "Wait action completed as requested; no page change is required.",
+                    "status": "success",
+                    "should_retry": False,
+                    "next_action": "continue",
+                    "special_case": None,
+                }
+                return {
+                    "step_index": step_index,
+                    "retry_index": retry_index,
+                    "description": step_description,
+                    "action": action_taken,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                    "verification": verification,
+                    "verification_raw": "local_wait_short_circuit",
+                    "status": "success"
+                }
+
             # 4. 验证执行结果
             verification, verification_raw = self.vlm.verify_step_success(
                 task=task,
                 step_description=step_description,
-                action_taken=action_result.get("action", "unknown"),
+                action_taken=action_taken,
                 before_url=before_url,
                 after_url=after_url,
                 before_image_base64=before_screenshot,

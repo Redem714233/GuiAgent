@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import logging
+import shlex
+from pathlib import Path
 from typing import Optional, Tuple
 
 from playwright.async_api import async_playwright
@@ -22,6 +25,15 @@ class Executor:
         self._viewport_width = int(os.getenv("PLAYWRIGHT_VIEWPORT_WIDTH", "1280"))
         self._viewport_height = int(os.getenv("PLAYWRIGHT_VIEWPORT_HEIGHT", "720"))
         self._device_scale_factor = float(os.getenv("PLAYWRIGHT_DEVICE_SCALE_FACTOR", "1"))
+        self._persistent_context = str(os.getenv("PLAYWRIGHT_PERSISTENT_CONTEXT", "0")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self._user_data_dir = str(
+            os.getenv(
+                "PLAYWRIGHT_USER_DATA_DIR",
+                Path("data").joinpath("playwright_user_data").as_posix(),
+            )
+        ).strip()
 
         # DOM 服务（延迟初始化）
         self._dom_service = None
@@ -35,16 +47,66 @@ class Executor:
         return self._dom_service
 
     def _on_new_page(self, page) -> None:
-        # If navigation opens a new tab/window, switch to it for subsequent actions/screenshot.
-        self._page = page
+        # Only switch to new page when it has a meaningful non-blank URL.
+        # Download popups often open as about:blank briefly; switching immediately can break flow.
+        async def _maybe_switch() -> None:
+            try:
+                for _ in range(8):
+                    if page.is_closed():
+                        return
+                    try:
+                        page_url = (page.url or "").strip().lower()
+                    except Exception:
+                        page_url = ""
+
+                    if page_url and not page_url.startswith("about:blank"):
+                        self._page = page
+                        with contextlib.suppress(Exception):
+                            await page.bring_to_front()
+                        return
+                    await asyncio.sleep(0.1)
+            except Exception:
+                return
+
         try:
-            asyncio.create_task(page.bring_to_front())
+            asyncio.create_task(_maybe_switch())
         except RuntimeError:
             pass
 
     async def _start_fresh(self) -> None:
         self._playwright = await async_playwright().start()
-        launch_kwargs = {"headless": False}
+        base_args = [
+            "--disable-features=DownloadBubble,DownloadBubbleV2",
+            "--safebrowsing-disable-download-protection",
+        ]
+
+        if str(self._channel or "").lower() == "msedge":
+            base_args.extend(
+                [
+                    "--hide-edge-download-bubble",
+                    "--disable-features=msEdgeDownloadBubble,msEdgeDownloadBubbleV2",
+                ]
+            )
+
+        extra_args_raw = str(os.getenv("PLAYWRIGHT_BROWSER_ARGS", "") or "").strip()
+        extra_args: list[str] = []
+        if extra_args_raw:
+            with contextlib.suppress(Exception):
+                extra_args = [arg for arg in shlex.split(extra_args_raw, posix=False) if str(arg or "").strip()]
+
+        merged_args: list[str] = []
+        seen_args: set[str] = set()
+        for arg in [*base_args, *extra_args]:
+            token = str(arg or "").strip()
+            if not token or token in seen_args:
+                continue
+            seen_args.add(token)
+            merged_args.append(token)
+
+        launch_kwargs = {
+            "headless": False,
+            "args": merged_args,
+        }
 
         # 根据 channel 选择浏览器类型
         if self._channel in ["msedge", "chrome"]:
@@ -64,7 +126,7 @@ class Executor:
             if self._executable:
                 launch_kwargs["executable_path"] = self._executable
 
-        self._browser = await browser_type.launch(**launch_kwargs)
+        self._browser = None
 
         # 创建更真实的浏览器上下文（反反爬虫）
         context_options = {
@@ -85,12 +147,26 @@ class Executor:
             "locale": "zh-CN",
         }
 
-        self._context = await self._browser.new_context(**context_options)
+        if self._persistent_context:
+            user_data_dir = str(Path(self._user_data_dir).expanduser().resolve())
+            os.makedirs(user_data_dir, exist_ok=True)
+            logger.info(f"Launching persistent context with user data dir: {user_data_dir}")
+            persistent_launch_kwargs = {**launch_kwargs, **context_options}
+            self._context = await browser_type.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                **persistent_launch_kwargs,
+            )
+            self._browser = self._context.browser
+        else:
+            self._browser = await browser_type.launch(**launch_kwargs)
+            self._context = await self._browser.new_context(**context_options)
+
         self._context.on("page", self._on_new_page)
-        self._page = await self._context.new_page()
+        existing_pages = [page for page in list(self._context.pages) if page and not page.is_closed()]
+        self._page = existing_pages[0] if existing_pages else await self._context.new_page()
 
         # 注入反检测脚本（隐藏 webdriver 特征）
-        await self._page.add_init_script("""
+        stealth_init_script = """
             // 覆盖 navigator.webdriver
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
@@ -108,7 +184,11 @@ class Executor:
                     Promise.resolve({ state: Notification.permission }) :
                     originalQuery(parameters)
             );
-        """)
+        """
+        with contextlib.suppress(Exception):
+            await self._context.add_init_script(stealth_init_script)
+        with contextlib.suppress(Exception):
+            await self._page.add_init_script(stealth_init_script)
 
         if self._start_url:
             await self._page.goto(self._start_url)
@@ -117,11 +197,15 @@ class Executor:
         if self._playwright is None:
             await self._start_fresh()
             return
-        if self._browser is None or not self._browser.is_connected():
+        if self._browser is not None and not self._browser.is_connected():
             await self._restart()
             await self._start_fresh()
             return
         if self._context is None:
+            if self._persistent_context:
+                await self._restart()
+                await self._start_fresh()
+                return
             self._context = await self._browser.new_context(
                 viewport={"width": self._viewport_width, "height": self._viewport_height},
                 device_scale_factor=self._device_scale_factor,
@@ -133,14 +217,16 @@ class Executor:
                 await self._page.goto(self._start_url)
 
     async def _restart(self) -> None:
+        context = self._context
+        browser = self._browser
         try:
-            if self._context:
-                await self._context.close()
+            if context:
+                await context.close()
         except Exception:
             pass
         try:
-            if self._browser:
-                await self._browser.close()
+            if browser and browser.is_connected():
+                await browser.close()
         except Exception:
             pass
         try:

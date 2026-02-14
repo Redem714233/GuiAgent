@@ -4,6 +4,7 @@ playwright
 pydantic
 python-dotenv
 openai
+dateparser
 
 pandas
 openpyxl

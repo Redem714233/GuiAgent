@@ -45,10 +45,18 @@ type StreamStepItem = {
 const STEEL_STAGE_TITLE: Record<string, string> = {
   auth: "加载登录态",
   navigation: "进入历史记录页",
+  navigation_retry: "重试进入历史记录页",
+  navigation_verify_failed: "进入历史记录页验证失败",
   date: "设置日期范围",
+  date_retry: "重试设置日期范围",
+  date_verify_failed: "日期设置验证失败",
   filter: "筛选异常状态",
+  filter_retry: "重试筛选状态",
+  filter_verify_failed: "筛选状态验证失败",
   wait_ready: "等待筛选结果",
+  wait_ready_verify_failed: "筛选结果验证失败",
   download_excel: "下载异常Excel",
+  download_excel_retry: "重试下载Excel",
   download_zip: "下载原始图片ZIP",
   download_zip_retry: "重试图片下载",
   recover: "恢复后重试",
@@ -79,6 +87,67 @@ const toSteelStep = (
     user_message: isFailed ? normalizedMessage : undefined,
   };
 };
+
+const summarizeSteelObservation = (observation: unknown): string => {
+  if (!observation || typeof observation !== "object") return "";
+  const record = observation as Record<string, unknown>;
+
+  const url = String(record.url || "").trim();
+  const isHistory = Boolean(record.is_history);
+  const isLogin = Boolean(record.is_login);
+  const ready = Boolean(record.ready);
+  const selectedCount = record.selected_count;
+
+  const parts: string[] = [];
+  if (url) parts.push(url);
+  parts.push(isHistory ? "history=是" : "history=否");
+  parts.push(isLogin ? "login=是" : "login=否");
+  parts.push(ready ? "ready=是" : "ready=否");
+  if (selectedCount !== null && selectedCount !== undefined) {
+    parts.push(`selected=${String(selectedCount)}`);
+  }
+  return parts.join(" | ");
+};
+
+const toSteelObserveStep = (
+  stage: string,
+  phase: string,
+  attempt: number,
+  objective: string,
+  observation: unknown,
+  index: number,
+): StreamStepItem => {
+  const normalizedStage = (stage || "observe").trim();
+  const normalizedPhase = (phase || "after").trim();
+  const phaseTitle = normalizedPhase === "before" ? "执行前观察" : "执行后观察";
+  const summary = summarizeSteelObservation(observation);
+  const stageTitle = STEEL_STAGE_TITLE[normalizedStage] || normalizedStage;
+  const reasoningParts = [
+    objective ? `目标: ${objective}` : "",
+    summary ? `观察: ${summary}` : "",
+  ].filter(Boolean);
+
+  return {
+    step_index: index,
+    retry_index: Math.max(0, (Number.isFinite(attempt) ? attempt : 1) - 1),
+    description: `${phaseTitle} · ${stageTitle}`,
+    action: `observe:${normalizedStage}:${normalizedPhase}`,
+    verification: { reasoning: reasoningParts.join("；") || "观察完成" },
+    status: "success",
+  };
+};
+
+const createEmptyTaskResult = (): RunTaskResponse => ({
+  status: "running",
+  steps: [],
+  extracted_items: [],
+  excel_file: null,
+  termination_reason: null,
+  user_message: null,
+  final_url: "",
+  reasoning: "",
+  plan: [],
+});
 
 type FileListResponse = {
   files: string[];
@@ -159,11 +228,39 @@ function App() {
           if (!steelStepKeysRef.current.has(stepKey)) {
             steelStepKeysRef.current.add(stepKey);
             setTaskResult(prev => {
-              if (!prev) return prev;
-              const nextIndex = prev.steps.length;
+              const base = prev ?? createEmptyTaskResult();
+              const nextIndex = base.steps.length;
               return {
-                ...prev,
-                steps: [...prev.steps, toSteelStep(stageName, message, nextIndex)],
+                ...base,
+                steps: [...base.steps, toSteelStep(stageName, message, nextIndex)],
+              };
+            });
+          }
+          return;
+        }
+
+        if (data.type === "steel_observe") {
+          const stageName = String(data.stage || "observe").trim();
+          const phase = String(data.phase || "after").trim();
+          const attempt = Number(data.attempt || 1);
+          const objective = String(data.objective || "").trim();
+          const summary = summarizeSteelObservation(data.observation);
+
+          const phaseLabel = phase === "before" ? "执行前" : "执行后";
+          setStatus(`🔍 [${stageName}] ${phaseLabel}观察${summary ? ` · ${summary}` : ""}`);
+
+          const stepKey = `observe::${stageName}::${attempt}::${phase}::${summary}`;
+          if (!steelStepKeysRef.current.has(stepKey)) {
+            steelStepKeysRef.current.add(stepKey);
+            setTaskResult(prev => {
+              const base = prev ?? createEmptyTaskResult();
+              const nextIndex = base.steps.length;
+              return {
+                ...base,
+                steps: [
+                  ...base.steps,
+                  toSteelObserveStep(stageName, phase, attempt, objective, data.observation, nextIndex),
+                ],
               };
             });
           }
@@ -172,17 +269,7 @@ function App() {
 
         if (data.type === "start") {
           setStatus("🚀 开始执行任务...");
-          setTaskResult({
-            status: "running",
-            steps: [],
-            extracted_items: [],
-            excel_file: null,
-            termination_reason: null,
-            user_message: null,
-            final_url: "",
-            reasoning: "",
-            plan: []
-          });
+          setTaskResult(createEmptyTaskResult());
         } else if (data.type === "plan") {
           setTaskResult(prev => prev ? {...prev, plan: data.steps} : null);
           setStatus(`📋 已规划 ${data.steps.length} 个步骤`);

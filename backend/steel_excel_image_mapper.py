@@ -24,6 +24,52 @@ def _ordered_images(images: list[Path], reverse_mapping: bool) -> list[Path]:
     return list(reversed(sorted_images)) if reverse_mapping else sorted_images
 
 
+def _ordered_images_by_preferred_filenames(
+    images: list[Path],
+    preferred_filenames: list[str],
+    reverse_mapping: bool,
+) -> list[Path]:
+    base_order = _ordered_images(images, reverse_mapping=reverse_mapping)
+    normalized_images = [(img, img.name.lower(), img.stem.lower()) for img in base_order]
+
+    matched: list[Path] = []
+    used: set[Path] = set()
+
+    for raw_name in preferred_filenames:
+        key = str(raw_name or "").strip().lower()
+        if not key:
+            continue
+
+        key_base = Path(key).name.lower()
+        key_stem = Path(key).stem.lower()
+        candidates = [key_base]
+        if key_stem:
+            candidates.append(key_stem)
+
+        chosen: Optional[Path] = None
+        for img, img_name, img_stem in normalized_images:
+            if img in used:
+                continue
+            if any(token and (img_name == token or img_stem == token) for token in candidates):
+                chosen = img
+                break
+
+        if chosen is None:
+            for img, img_name, img_stem in normalized_images:
+                if img in used:
+                    continue
+                if any(token and (token in img_name or token in img_stem) for token in candidates):
+                    chosen = img
+                    break
+
+        if chosen is not None:
+            matched.append(chosen)
+            used.add(chosen)
+
+    remaining = [img for img in base_order if img not in used]
+    return matched + remaining
+
+
 def _collect_images_from_dir(images_dir: Path) -> list[Path]:
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     all_files = [p for p in images_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts]
@@ -101,6 +147,7 @@ def generate_excel_with_embedded_images(
     images_zip: Optional[str | Path] = None,
     output_path: Optional[str | Path] = None,
     reverse_mapping: bool = True,
+    preferred_filenames: Optional[list[str]] = None,
     column_name: str = "原始图片",
     image_width: int = 160,
     image_height: int = 120,
@@ -119,7 +166,14 @@ def generate_excel_with_embedded_images(
 
     if images_dir:
         raw_images = _collect_images_from_dir(Path(images_dir))
-        ordered_images = _ordered_images(raw_images, reverse_mapping=reverse_mapping)
+        if preferred_filenames:
+            ordered_images = _ordered_images_by_preferred_filenames(
+                raw_images,
+                preferred_filenames=preferred_filenames,
+                reverse_mapping=reverse_mapping,
+            )
+        else:
+            ordered_images = _ordered_images(raw_images, reverse_mapping=reverse_mapping)
         embed_original_images_column(
             excel_path=excel_file,
             output_path=output_file,
@@ -132,7 +186,14 @@ def generate_excel_with_embedded_images(
 
     with tempfile.TemporaryDirectory(prefix="steel_images_") as temp_dir:
         raw_images = _extract_images_from_zip(Path(images_zip), Path(temp_dir))
-        ordered_images = _ordered_images(raw_images, reverse_mapping=reverse_mapping)
+        if preferred_filenames:
+            ordered_images = _ordered_images_by_preferred_filenames(
+                raw_images,
+                preferred_filenames=preferred_filenames,
+                reverse_mapping=reverse_mapping,
+            )
+        else:
+            ordered_images = _ordered_images(raw_images, reverse_mapping=reverse_mapping)
         embed_original_images_column(
             excel_path=excel_file,
             output_path=output_file,
