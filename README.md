@@ -2,6 +2,15 @@
 
 ---
 
+## 📹 演示视频
+
+> 视频文件较大，已上传至 [Releases](https://github.com/Redem714233/GuiAgent/releases/tag/v1.0-demo) 页面
+
+- **功能演示 1**: [test1_compressed.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test1_compressed.mp4)
+- **功能演示 2**: [test2_compressed.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test2_compressed.mp4)
+
+---
+
 ## 1. 项目是什么
 
 GUIAgent 是一个网页自动化系统，技术栈为：
