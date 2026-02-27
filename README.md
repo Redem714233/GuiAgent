@@ -4,10 +4,13 @@
 
 ## 📹 演示视频
 
-> 请访问 [Releases 页面](https://github.com/Redem714233/GuiAgent/releases/tag/v1.0-demo) 查看演示视频
+### 功能演示 1
+https://github.com/Redem714233/GuiAgent/assets/161357668/1b9798d5-e046-4ab0-9c68-17c2d1227315
 
-- test1.mp4：功能演示 1
-- test2.mp4：功能演示 2
+### 功能演示 2
+https://github.com/Redem714233/GuiAgent/assets/161357668/638f9125-d28a-4c95-bfbf-cb18c1c65119
+
+> 如果视频无法播放，请访问 [Releases 页面](https://github.com/Redem714233/GuiAgent/releases/tag/v1.0-demo) 下载观看
 
 ---
 
