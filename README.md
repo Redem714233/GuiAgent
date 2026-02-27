@@ -6,8 +6,8 @@
 
 > 视频文件较大，已上传至 [Releases](https://github.com/Redem714233/GuiAgent/releases/tag/v1.0-demo) 页面
 
-- **功能演示 1**: [test1_compressed.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test1_compressed.mp4)
-- **功能演示 2**: [test2_compressed.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test2_compressed.mp4)
+- **功能演示 1**: [test1.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test1.mp4)
+- **功能演示 2**: [test2.mp4](https://github.com/Redem714233/GuiAgent/releases/download/v1.0-demo/test2.mp4)
 
 ---
 
